@@ -136,15 +136,19 @@ def _format_tools_for_api(
     return formatted
 
 
-def _parse_tool_calls(raw_tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _parse_tool_calls(
+    raw_tool_calls: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
     """Parse raw API tool_calls into LangChain tool_calls format."""
-    tool_calls = []
+    tool_calls: List[Dict[str, Any]] = []
     for raw in raw_tool_calls:
         try:
             parsed = parse_tool_call(raw, return_id=True)
-            tool_calls.append(parsed)
+            if parsed is not None:
+                tool_calls.append(parsed)
         except Exception as exc:
-            tool_calls.append(make_invalid_tool_call(raw, str(exc)))
+            invalid = make_invalid_tool_call(raw, str(exc))
+            tool_calls.append(dict(invalid))
     return tool_calls
 
 
