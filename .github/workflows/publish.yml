@@ -35,6 +35,9 @@ jobs:
           virtualenvs-create: true
           virtualenvs-in-project: true
 
+      - name: Update lock file if needed
+        run: poetry lock --no-update
+
       - name: Install dependencies
         run: poetry install --no-interaction
 
@@ -60,7 +63,7 @@ jobs:
       url: https://pypi.org/p/langchain-githubcopilot-chat
 
     permissions:
-      id-token: write  # Required for OIDC Trusted Publisher
+      id-token: write # Required for OIDC Trusted Publisher
 
     steps:
       - name: Download distribution artifacts
@@ -85,7 +88,7 @@ jobs:
       url: https://test.pypi.org/p/langchain-githubcopilot-chat
 
     permissions:
-      id-token: write  # Required for OIDC Trusted Publisher
+      id-token: write # Required for OIDC Trusted Publisher
 
     steps:
       - name: Download distribution artifacts
