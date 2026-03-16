@@ -123,7 +123,9 @@ def _message_to_dict(message: BaseMessage) -> Dict[str, Any]:
 def _format_tools_for_api(
     tools: Sequence[Union[Dict[str, Any], BaseTool, Type]],
 ) -> List[Dict[str, Any]]:
-    """Convert LangChain tools into the OpenAI-compatible format expected by GitHub Models."""
+    """Convert LangChain tools into the OpenAI-compatible format
+    expected by GitHub Models.
+    """
     formatted = []
     for tool in tools:
         if isinstance(tool, dict) and tool.get("type") == "function":
@@ -311,12 +313,15 @@ class ChatGithubCopilot(BaseChatModel):
 
             class GetWeather(BaseModel):
                 '''Get the current weather in a given location.'''
-                location: str = Field(..., description="City and state, e.g. Paris, France")
+                location: str = Field(
+                    ..., description="City and state, e.g. Paris, France"
+                )
 
             llm_with_tools = llm.bind_tools([GetWeather])
             ai_msg = llm_with_tools.invoke("What is the weather like in Paris?")
             print(ai_msg.tool_calls)
-            # [{'name': 'GetWeather', 'args': {'location': 'Paris, France'}, 'id': '...'}]
+            # [{'name': 'GetWeather', 'args': {'location': 'Paris, France'},
+            #   'id': '...'}]
 
     Structured output:
         .. code-block:: python
@@ -469,7 +474,8 @@ class ChatGithubCopilot(BaseChatModel):
         if not env_token:
             raise ValueError(
                 "A GitHub token is required.  Set the GITHUB_TOKEN environment "
-                "variable or pass ``github_token`` when instantiating ChatGithubCopilot."
+                "variable or pass ``github_token`` when instantiating "
+                "ChatGithubCopilot."
             )
         return env_token
 

@@ -7,9 +7,8 @@ Set the GITHUB_TOKEN environment variable before running:
     pytest tests/integration_tests/test_chat_models.py -v
 """
 
-from typing import Type
-
 import time
+from typing import Type
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -132,7 +131,6 @@ def test_streaming_accumulates_correctly(llm: ChatGithubCopilot) -> None:
 @pytest.mark.integration
 def test_streaming_token_usage(llm: ChatGithubCopilot) -> None:
     """Token usage should appear in the streamed response (final chunk)."""
-    chunks = list(llm.stream([HumanMessage("Say hello.")]))
     stream = llm.stream([HumanMessage("Say hello.")])
     full = next(stream)
     for chunk in stream:
@@ -184,7 +182,6 @@ def test_tool_calling(llm: ChatGithubCopilot) -> None:
 def test_tool_calling_full_loop(llm: ChatGithubCopilot) -> None:
     """A complete tool-calling loop should produce a final text response."""
     from langchain_core.messages import ToolMessage
-
     from pydantic import BaseModel, Field
 
     class GetCapital(BaseModel):
@@ -214,8 +211,6 @@ def test_tool_calling_full_loop(llm: ChatGithubCopilot) -> None:
 @pytest.mark.integration
 def test_structured_output(llm: ChatGithubCopilot) -> None:
     """with_structured_output() should return a populated Pydantic object."""
-    from typing import List
-
     from pydantic import BaseModel, Field
 
     class Country(BaseModel):
@@ -248,7 +243,8 @@ def test_json_mode(llm: ChatGithubCopilot) -> None:
                 "You are a helpful assistant. Always respond with valid JSON."
             ),
             HumanMessage(
-                "Return a JSON object with a single key 'answer' whose value is the string 'Paris'."
+                "Return a JSON object with a single key 'answer' "
+                "whose value is the string 'Paris'."
             ),
         ]
     )
