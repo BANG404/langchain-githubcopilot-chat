@@ -19,9 +19,9 @@ disallow_untyped_defs = "True"
 "Release Notes" = "https://github.com/langchain-ai/langchain/releases?q=tag%3A%22githubcopilot-chat%3D%3D0%22&expanded=true"
 
 [tool.poetry.dependencies]
-python = ">=3.9,<4.0"
-langchain-core = "^0.3.15"
-httpx = ">=0.24.0"
+python = ">=3.10,<4.0"
+langchain-core = ">=1.1.0,<2.0.0"
+httpx = ">=0.28.1"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "T201"]
@@ -59,7 +59,7 @@ pytest = "^7.4.3"
 pytest-asyncio = "^0.23.2"
 pytest-socket = "^0.7.0"
 pytest-watcher = "^0.3.4"
-langchain-tests = "^0.3.5"
+langchain-tests = "^1.1.5"
 
 [tool.poetry.group.codespell.dependencies]
 codespell = "^2.2.6"

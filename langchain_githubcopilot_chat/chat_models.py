@@ -445,6 +445,11 @@ class ChatGithubCopilot(BaseChatModel):
     """Number of automatic retries on transient errors."""
 
     # ------------------------------------------------------------------
+    # Pydantic v2 config — allow the ``model`` alias on construction
+    # ------------------------------------------------------------------
+    model_config = {"populate_by_name": True}
+
+    # ------------------------------------------------------------------
     # Validators / setup
     # ------------------------------------------------------------------
 
