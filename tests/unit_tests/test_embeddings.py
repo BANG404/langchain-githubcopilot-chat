@@ -2,8 +2,9 @@
 
 from typing import Type
 
-from langchain_githubcopilot_chat.embeddings import GithubcopilotChatEmbeddings
 from langchain_tests.unit_tests import EmbeddingsUnitTests
+
+from langchain_githubcopilot_chat.embeddings import GithubcopilotChatEmbeddings
 
 
 class TestParrotLinkEmbeddingsUnit(EmbeddingsUnitTests):

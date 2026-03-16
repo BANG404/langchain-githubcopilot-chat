@@ -1,18 +1,16 @@
 """Unit tests for ChatGithubCopilot chat model."""
 
-import os
 from typing import Type
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_tests.unit_tests import ChatModelUnitTests
 
 from langchain_githubcopilot_chat.chat_models import (
     ChatGithubCopilot,
     ChatGithubcopilotChat,
 )
-from langchain_tests.unit_tests import ChatModelUnitTests
-
 
 # ---------------------------------------------------------------------------
 # Standard LangChain unit test suite

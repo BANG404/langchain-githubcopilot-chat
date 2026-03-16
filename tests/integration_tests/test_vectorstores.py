@@ -1,9 +1,10 @@
 from typing import Generator
 
 import pytest
-from langchain_githubcopilot_chat.vectorstores import GithubcopilotChatVectorStore
 from langchain_core.vectorstores import VectorStore
 from langchain_tests.integration_tests import VectorStoreIntegrationTests
+
+from langchain_githubcopilot_chat.vectorstores import GithubcopilotChatVectorStore
 
 
 class TestGithubcopilotChatVectorStore(VectorStoreIntegrationTests):

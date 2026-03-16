@@ -12,10 +12,9 @@ from typing import Type
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-
-from langchain_githubcopilot_chat.chat_models import ChatGithubCopilot
 from langchain_tests.integration_tests import ChatModelIntegrationTests
 
+from langchain_githubcopilot_chat.chat_models import ChatGithubCopilot
 
 # ---------------------------------------------------------------------------
 # Standard LangChain integration test suite

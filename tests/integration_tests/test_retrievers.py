@@ -1,9 +1,10 @@
 from typing import Type
 
-from langchain_githubcopilot_chat.retrievers import GithubcopilotChatRetriever
 from langchain_tests.integration_tests import (
     RetrieversIntegrationTests,
 )
+
+from langchain_githubcopilot_chat.retrievers import GithubcopilotChatRetriever
 
 
 class TestGithubcopilotChatRetriever(RetrieversIntegrationTests):

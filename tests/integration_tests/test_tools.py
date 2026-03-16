@@ -1,7 +1,8 @@
 from typing import Type
 
-from langchain_githubcopilot_chat.tools import GithubcopilotChatTool
 from langchain_tests.integration_tests import ToolsIntegrationTests
+
+from langchain_githubcopilot_chat.tools import GithubcopilotChatTool
 
 
 class TestParrotMultiplyToolIntegration(ToolsIntegrationTests):
