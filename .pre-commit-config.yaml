@@ -1,0 +1,93 @@
+# .pre-commit-config.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+# Pre-commit hook configuration.
+# Mirrors the lint / spell-check steps in .github/workflows/ci.yml so that
+# issues are caught locally before they reach GitHub Actions.
+#
+# Quick-start
+# -----------
+#   pip install pre-commit          # install the pre-commit tool (once)
+#   pre-commit install              # register hooks in .git/hooks/pre-commit
+#   pre-commit install --hook-type pre-push   # also run on git push
+#
+# Run all hooks manually without committing:
+#   pre-commit run --all-files
+#
+# Or use the Makefile wrapper:
+#   make pre-commit-install         # installs the git pre-push hook via make
+#   make pre-commit-run             # run all checks now
+# ─────────────────────────────────────────────────────────────────────────────
+
+default_language_version:
+  python: python3.11
+
+# Run hooks on every commit and on push
+default_stages: [pre-commit, pre-push]
+
+repos:
+  # ---------------------------------------------------------------------------
+  # ruff – fast Python linter (replaces flake8 / isort)
+  # Matches: poetry run ruff check .
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    # Pin to the same minor series as [tool.poetry.group.lint.dependencies]
+    # ruff = "^0.5" → use the latest 0.5.x release tag.
+    rev: v0.5.7
+    hooks:
+      - id: ruff
+        name: ruff lint
+        args: [--fix]          # auto-fix fixable issues (e.g. unused imports)
+        types_or: [python, pyi, jupyter]
+
+      - id: ruff-format
+        name: ruff format
+        types_or: [python, pyi, jupyter]
+
+  # ---------------------------------------------------------------------------
+  # mypy – static type checking
+  # Matches: poetry run mypy langchain_githubcopilot_chat --cache-dir .mypy_cache
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.10.1              # keep in sync with [tool.poetry.group.typing] mypy = "^1.10"
+    hooks:
+      - id: mypy
+        name: mypy type check
+        # Check the package source only (same scope as CI)
+        files: ^langchain_githubcopilot_chat/
+        args:
+          - --cache-dir=.mypy_cache
+        # mypy needs the runtime dependencies available in the hook environment
+        additional_dependencies:
+          - "langchain-core>=1.1.0,<2.0.0"
+          - "httpx>=0.28.1"
+          - "pydantic>=2.0"
+
+  # ---------------------------------------------------------------------------
+  # codespell – catch common typos in source and docs
+  # Matches: poetry run codespell --toml pyproject.toml
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.1               # keep in sync with codespell = "^2.2.6"
+    hooks:
+      - id: codespell
+        name: codespell
+        # Pass the pyproject.toml so codespell picks up [tool.codespell] config
+        args: [--toml, pyproject.toml]
+        # Also check markdown docs
+        types_or: [python, markdown, rst, text]
+
+  # ---------------------------------------------------------------------------
+  # General hygiene hooks (no extra deps required)
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace   # remove trailing spaces
+      - id: end-of-file-fixer     # ensure files end with a newline
+      - id: check-yaml            # validate YAML syntax (CI workflows, etc.)
+        args: [--unsafe]          # allow custom YAML tags used by some tools
+      - id: check-toml            # validate pyproject.toml syntax
+      - id: check-merge-conflict  # catch leftover merge-conflict markers
+      - id: check-added-large-files
+        args: [--maxkb=500]       # block accidentally committed large files
+      - id: debug-statements      # catch stray breakpoint() / pdb.set_trace()
