@@ -92,15 +92,12 @@ def test_api_key_alias() -> None:
 
 def test_inference_url_default() -> None:
     llm = ChatGithubCopilot(model="openai/gpt-4.1", github_token="tok")
-    assert llm._inference_url == "https://models.github.ai/inference/chat/completions"
+    assert llm._inference_url == "https://api.githubcopilot.com/chat/completions"
 
 
 def test_inference_url_with_org() -> None:
     llm = ChatGithubCopilot(model="openai/gpt-4.1", github_token="tok", org="my-org")
-    assert (
-        llm._inference_url
-        == "https://models.github.ai/orgs/my-org/inference/chat/completions"
-    )
+    assert llm._inference_url == "https://api.githubcopilot.com/chat/completions"
 
 
 def test_inference_url_custom_base_url() -> None:
@@ -109,10 +106,7 @@ def test_inference_url_custom_base_url() -> None:
         github_token="tok",
         base_url="https://custom.endpoint.example.com",
     )
-    assert (
-        llm._inference_url
-        == "https://custom.endpoint.example.com/inference/chat/completions"
-    )
+    assert llm._inference_url == "https://custom.endpoint.example.com/chat/completions"
 
 
 def test_inference_url_strips_trailing_slash() -> None:
@@ -121,7 +115,7 @@ def test_inference_url_strips_trailing_slash() -> None:
         github_token="tok",
         base_url="https://models.github.ai/",
     )
-    assert llm._inference_url == "https://models.github.ai/inference/chat/completions"
+    assert llm._inference_url == "https://models.github.ai/chat/completions"
 
 
 # ---------------------------------------------------------------------------
@@ -135,16 +129,7 @@ def test_build_headers_contains_auth(monkeypatch: pytest.MonkeyPatch) -> None:
     headers = llm._build_headers()
     assert headers["Authorization"] == "Bearer ghp_mytoken"
     assert headers["Content-Type"] == "application/json"
-    assert "X-GitHub-Api-Version" in headers
-
-
-def test_build_headers_api_version() -> None:
-    llm = ChatGithubCopilot(
-        model="openai/gpt-4.1",
-        github_token="tok",
-        api_version="2026-03-10",
-    )
-    assert llm._build_headers()["X-GitHub-Api-Version"] == "2026-03-10"
+    assert "Copilot-Integration-Id" in headers
 
 
 # ---------------------------------------------------------------------------
@@ -506,7 +491,7 @@ def test_bind_tools_default_tool_choice_is_auto() -> None:
 
 def test_llm_type() -> None:
     llm = ChatGithubCopilot(model="openai/gpt-4.1", github_token="tok")
-    assert llm._llm_type == "chat-github-copilot"
+    assert llm._llm_type == "github-copilot"
 
 
 def test_identifying_params() -> None:

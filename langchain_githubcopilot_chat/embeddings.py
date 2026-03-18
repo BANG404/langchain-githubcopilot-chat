@@ -9,10 +9,23 @@ import httpx
 from langchain_core.embeddings import Embeddings
 from pydantic import BaseModel, Field, SecretStr, model_validator
 
-_GITHUB_MODELS_BASE_URL = "https://models.github.ai"
-_EMBEDDINGS_PATH = "/inference/embeddings"
-_ORG_EMBEDDINGS_PATH = "/orgs/{org}/inference/embeddings"
-_API_VERSION = "2026-03-10"
+_GITHUB_COPILOT_BASE_URL = "https://api.githubcopilot.com"
+_EMBEDDINGS_PATH = "/embeddings"
+
+COPILOT_EDITOR_VERSION = "vscode/1.104.1"
+COPILOT_PLUGIN_VERSION = "copilot-chat/0.26.7"
+COPILOT_INTEGRATION_ID = "vscode-chat"
+COPILOT_USER_AGENT = "GitHubCopilotChat/0.26.7"
+
+COPILOT_DEFAULT_HEADERS = {
+    "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
+    "User-Agent": COPILOT_USER_AGENT,
+    "Editor-Version": COPILOT_EDITOR_VERSION,
+    "Editor-Plugin-Version": COPILOT_PLUGIN_VERSION,
+    "editor-version": COPILOT_EDITOR_VERSION,
+    "editor-plugin-version": COPILOT_PLUGIN_VERSION,
+    "copilot-vision-request": "true",
+}
 
 
 class GithubcopilotChatEmbeddings(BaseModel, Embeddings):
@@ -109,18 +122,8 @@ class GithubcopilotChatEmbeddings(BaseModel, Embeddings):
     is used.
     """
 
-    base_url: str = _GITHUB_MODELS_BASE_URL
-    """Base URL for the GitHub Models REST API."""
-
-    org: Optional[str] = None
-    """Organisation login for attributed inference requests.
-
-    When set, requests are sent to
-    ``/orgs/{org}/inference/embeddings`` instead of ``/inference/embeddings``.
-    """
-
-    api_version: str = _API_VERSION
-    """GitHub Models API version sent as the ``X-GitHub-Api-Version`` header."""
+    base_url: str = _GITHUB_COPILOT_BASE_URL
+    """Base URL for the GitHub Copilot API."""
 
     dimensions: Optional[int] = None
     """Number of output embedding dimensions.
@@ -173,19 +176,16 @@ class GithubcopilotChatEmbeddings(BaseModel, Embeddings):
     @property
     def _embeddings_url(self) -> str:
         """Return the full embeddings endpoint URL."""
-        if self.org:
-            path = _ORG_EMBEDDINGS_PATH.format(org=self.org)
-        else:
-            path = _EMBEDDINGS_PATH
-        return self.base_url.rstrip("/") + path
+        return self.base_url.rstrip("/") + _EMBEDDINGS_PATH
 
     def _build_headers(self) -> Dict[str, str]:
-        return {
+        headers = {
             "Authorization": f"Bearer {self._token}",
-            "Accept": "application/vnd.github+json",
+            "Accept": "application/json",
             "Content-Type": "application/json",
-            "X-GitHub-Api-Version": self.api_version,
         }
+        headers.update(COPILOT_DEFAULT_HEADERS)
+        return headers
 
     def _build_payload(self, input: Union[str, List[str]]) -> Dict[str, Any]:
         """Assemble the JSON body for the embeddings API."""

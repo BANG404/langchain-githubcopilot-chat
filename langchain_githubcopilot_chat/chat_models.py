@@ -56,10 +56,23 @@ _ROLE_MAP = {
     "tool": "tool",
 }
 
-_GITHUB_MODELS_BASE_URL = "https://models.github.ai"
-_INFERENCE_PATH = "/inference/chat/completions"
-_ORG_INFERENCE_PATH = "/orgs/{org}/inference/chat/completions"
-_API_VERSION = "2026-03-10"
+_GITHUB_COPILOT_BASE_URL = "https://api.githubcopilot.com"
+_INFERENCE_PATH = "/chat/completions"
+
+COPILOT_EDITOR_VERSION = "vscode/1.104.1"
+COPILOT_PLUGIN_VERSION = "copilot-chat/0.26.7"
+COPILOT_INTEGRATION_ID = "vscode-chat"
+COPILOT_USER_AGENT = "GitHubCopilotChat/0.26.7"
+
+COPILOT_DEFAULT_HEADERS = {
+    "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
+    "User-Agent": COPILOT_USER_AGENT,
+    "Editor-Version": COPILOT_EDITOR_VERSION,
+    "Editor-Plugin-Version": COPILOT_PLUGIN_VERSION,
+    "editor-version": COPILOT_EDITOR_VERSION,
+    "editor-plugin-version": COPILOT_PLUGIN_VERSION,
+    "copilot-vision-request": "true",
+}
 
 
 def _message_to_dict(message: BaseMessage) -> Dict[str, Any]:
@@ -403,19 +416,8 @@ class ChatGithubCopilot(BaseChatModel):
     is used.
     """
 
-    base_url: str = _GITHUB_MODELS_BASE_URL
-    """Base URL for the GitHub Models REST API."""
-
-    org: Optional[str] = None
-    """Organisation login for attributed inference requests.
-
-    When set, requests are sent to
-    ``/orgs/{org}/inference/chat/completions`` instead of
-    ``/inference/chat/completions``.
-    """
-
-    api_version: str = _API_VERSION
-    """GitHub Models API version sent as the ``X-GitHub-Api-Version`` header."""
+    base_url: str = _GITHUB_COPILOT_BASE_URL
+    """Base URL for the GitHub Copilot API."""
 
     temperature: Optional[float] = None
     """Sampling temperature in ``[0, 1]``."""
@@ -491,19 +493,43 @@ class ChatGithubCopilot(BaseChatModel):
     @property
     def _inference_url(self) -> str:
         """Return the full chat-completions endpoint URL."""
-        if self.org:
-            path = _ORG_INFERENCE_PATH.format(org=self.org)
-        else:
-            path = _INFERENCE_PATH
-        return self.base_url.rstrip("/") + path
+        return self.base_url.rstrip("/") + _INFERENCE_PATH
 
     def _build_headers(self) -> Dict[str, str]:
-        return {
+        headers = {
             "Authorization": f"Bearer {self._token}",
-            "Accept": "application/vnd.github+json",
+            "Accept": "application/json",
             "Content-Type": "application/json",
-            "X-GitHub-Api-Version": self.api_version,
         }
+        headers.update(COPILOT_DEFAULT_HEADERS)
+        return headers
+
+    @classmethod
+    def get_available_models(
+        cls, github_token: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Get the list of available models from the GitHub Copilot API."""
+        token = github_token or os.environ.get("GITHUB_TOKEN")
+        if not token:
+            raise ValueError(
+                "A GitHub token is required. Set the GITHUB_TOKEN environment "
+                "variable or pass ``github_token``."
+            )
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        headers.update(COPILOT_DEFAULT_HEADERS)
+
+        url = f"{_GITHUB_COPILOT_BASE_URL}/models"
+
+        with httpx.Client() as client:
+            response = client.get(url, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            return data.get("data", [])
 
     def _build_payload(
         self,
@@ -712,7 +738,7 @@ class ChatGithubCopilot(BaseChatModel):
 
     @property
     def _llm_type(self) -> str:
-        return "chat-github-copilot"
+        return "github-copilot"
 
     @property
     def _identifying_params(self) -> Dict[str, Any]:

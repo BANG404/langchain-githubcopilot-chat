@@ -79,7 +79,7 @@ def test_embeddings_url_default() -> None:
     embed = GithubcopilotChatEmbeddings(
         model="openai/text-embedding-3-small", github_token="tok"
     )
-    assert embed._embeddings_url == "https://models.github.ai/inference/embeddings"
+    assert embed._embeddings_url == "https://api.githubcopilot.com/embeddings"
 
 
 def test_embeddings_url_with_org() -> None:
@@ -88,10 +88,7 @@ def test_embeddings_url_with_org() -> None:
         github_token="tok",
         org="my-org",
     )
-    assert (
-        embed._embeddings_url
-        == "https://models.github.ai/orgs/my-org/inference/embeddings"
-    )
+    assert embed._embeddings_url == "https://api.githubcopilot.com/embeddings"
 
 
 def test_embeddings_url_strips_trailing_slash() -> None:
@@ -100,11 +97,11 @@ def test_embeddings_url_strips_trailing_slash() -> None:
         github_token="tok",
         base_url="https://models.github.ai/",
     )
-    assert embed._embeddings_url == "https://models.github.ai/inference/embeddings"
+    assert embed._embeddings_url == "https://models.github.ai/embeddings"
 
 
 # ---------------------------------------------------------------------------
-# Header construction
+# Headers
 # ---------------------------------------------------------------------------
 
 
@@ -115,16 +112,7 @@ def test_build_headers_contains_auth() -> None:
     headers = embed._build_headers()
     assert headers["Authorization"] == "Bearer ghp_mytoken"
     assert headers["Content-Type"] == "application/json"
-    assert "X-GitHub-Api-Version" in headers
-
-
-def test_build_headers_api_version() -> None:
-    embed = GithubcopilotChatEmbeddings(
-        model="openai/text-embedding-3-small",
-        github_token="tok",
-        api_version="2026-03-10",
-    )
-    assert embed._build_headers()["X-GitHub-Api-Version"] == "2026-03-10"
+    assert "Copilot-Integration-Id" in headers
 
 
 # ---------------------------------------------------------------------------
