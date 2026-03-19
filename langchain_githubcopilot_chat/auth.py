@@ -66,9 +66,7 @@ def get_copilot_token(
 
             if "access_token" in token_res:
                 access_token = token_res["access_token"]
-                _print(
-                    "\n✅ Authorization successful! Exchanging for Copilot Token..."
-                )
+                _print("\n✅ Authorization successful! Exchanging for Copilot Token...")
                 break
             elif token_res.get("error") == "authorization_pending":
                 time.sleep(interval)
