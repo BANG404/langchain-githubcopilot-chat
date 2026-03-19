@@ -1,12 +1,14 @@
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 import httpx
 
 CLIENT_ID = "Iv1.b507a08c87ecfe98"
 
 
-def get_copilot_token(client_id: str = CLIENT_ID) -> Optional[str]:
+def get_copilot_token(
+    client_id: str = CLIENT_ID, callback: Optional[Callable[[str], None]] = None
+) -> Optional[str]:
     """
     Authenticate via GitHub Device Flow to get a Copilot Token.
     This function will block and wait for the user to complete the
@@ -15,11 +17,20 @@ def get_copilot_token(client_id: str = CLIENT_ID) -> Optional[str]:
     Args:
         client_id: The GitHub OAuth App Client ID to use. Defaults
             to the VS Code Copilot Chat client ID.
+        callback: Optional callable that receives status messages instead of
+            printing them. If None, messages are printed to stdout.
 
     Returns:
         The fetched Copilot Token string, or None if authentication failed.
     """
-    print("1. Requesting device code from GitHub...")  # noqa: T201  # noqa: T201
+
+    def _print(msg: str) -> None:
+        if callback:
+            callback(msg)
+        else:
+            print(msg)  # noqa: T201
+
+    _print("1. Requesting device code from GitHub...")
     with httpx.Client() as client:
         res = client.post(
             "https://github.com/login/device/code",
@@ -34,11 +45,11 @@ def get_copilot_token(client_id: str = CLIENT_ID) -> Optional[str]:
     verification_uri = data.get("verification_uri")
     interval = data.get("interval", 5)
 
-    print("\n==========================================")  # noqa: T201
-    print(f"Please open your browser to: {verification_uri}")  # noqa: T201
-    print(f"And enter the authorization code: {user_code}")  # noqa: T201
-    print("==========================================\n")  # noqa: T201
-    print(f"Waiting for authorization (checking every {interval} seconds)...")  # noqa: T201
+    _print("\n==========================================")
+    _print(f"Please open your browser to: {verification_uri}")
+    _print(f"And enter the authorization code: {user_code}")
+    _print("==========================================\n")
+    _print(f"Waiting for authorization (checking every {interval} seconds)...")
 
     access_token = None
     with httpx.Client() as client:
@@ -55,14 +66,14 @@ def get_copilot_token(client_id: str = CLIENT_ID) -> Optional[str]:
 
             if "access_token" in token_res:
                 access_token = token_res["access_token"]
-                print(  # noqa: T201  # noqa: T201
+                _print(
                     "\n✅ Authorization successful! Exchanging for Copilot Token..."
                 )
                 break
             elif token_res.get("error") == "authorization_pending":
                 time.sleep(interval)
             else:
-                print(f"\n❌ Authorization failed: {token_res}")  # noqa: T201  # noqa: T201
+                _print(f"\n❌ Authorization failed: {token_res}")
                 return None
 
         # Exchange the standard access token for a Copilot internal token
@@ -78,8 +89,8 @@ def get_copilot_token(client_id: str = CLIENT_ID) -> Optional[str]:
 
         if copilot_res.status_code == 200:
             copilot_token = copilot_res.json().get("token")
-            print("🎉 Successfully acquired Copilot Token!")  # noqa: T201  # noqa: T201
+            _print("🎉 Successfully acquired Copilot Token!")
             return copilot_token
         else:
-            print(f"❌ Failed to acquire Copilot Token: {copilot_res.text}")  # noqa: T201  # noqa: T201
+            _print(f"❌ Failed to acquire Copilot Token: {copilot_res.text}")
             return None

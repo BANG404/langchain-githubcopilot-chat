@@ -29,6 +29,18 @@ token = get_vscode_token()
 print(f"Your Token: {token}")
 ```
 
+For custom output handling (e.g., in GUI applications), pass a callback:
+
+```python
+from langchain_githubcopilot_chat import get_copilot_token
+
+def on_message(msg):
+    # Handle status messages (e.g., display in UI)
+    print(f"[Copilot] {msg}")
+
+token = get_vscode_token(callback=on_message)
+```
+
 Alternatively, set it as an environment variable:
 ```bash
 export GITHUB_TOKEN="your_copilot_token_here"
