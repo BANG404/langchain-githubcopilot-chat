@@ -514,7 +514,10 @@ class ChatGithubCopilot(BaseChatModel):
             tokens = load_tokens_from_cache()
             if "copilot_token" in tokens:
                 self._cached_copilot_token = tokens["copilot_token"]
-                self._cached_copilot_token_expires_at = tokens.get("expires_at")
+                raw_exp = tokens.get("expires_at")
+                self._cached_copilot_token_expires_at = (
+                    float(raw_exp) if raw_exp is not None else None
+                )
                 return tokens["copilot_token"]
             elif "github_token" in tokens:
                 token = tokens["github_token"]
