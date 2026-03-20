@@ -483,8 +483,11 @@ class ChatGithubCopilot(BaseChatModel):
     @property
     def _token(self) -> str:
         """Return the raw GitHub token string."""
-        if self._cached_copilot_token:
-            return self._cached_copilot_token
+        # Use getattr to avoid triggering Pydantic's __getattr__ on PrivateAttr
+        # when instance is created via __new__ without proper initialization
+        cached = getattr(self, "_cached_copilot_token", None)
+        if cached:
+            return cached
 
         token = None
         if self.github_token:
@@ -512,8 +515,9 @@ class ChatGithubCopilot(BaseChatModel):
         if token.startswith(("gho_", "ghp_", "ghu_")):
             try:
                 self._refresh_token_sync(token)
-                if self._cached_copilot_token:
-                    return self._cached_copilot_token
+                cached = getattr(self, "_cached_copilot_token", None)
+                if cached:
+                    return cached
             except Exception:
                 # Network unavailable or other error - use GitHub token directly
                 pass
