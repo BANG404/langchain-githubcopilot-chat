@@ -7,7 +7,6 @@ import json
 import logging
 import os
 import random
-import threading
 import time
 from typing import (
     Any,
@@ -497,7 +496,10 @@ class ChatGithubCopilot(BaseChatModel):
         cached = getattr(self, "_cached_copilot_token", None)
         cached_exp = getattr(self, "_cached_copilot_token_expires_at", None)
         if cached:
-            if cached_exp is None or time.time() < cached_exp - _TOKEN_REFRESH_BUFFER_SECS:
+            expires_ok = cached_exp is None or (
+                time.time() < cached_exp - _TOKEN_REFRESH_BUFFER_SECS
+            )
+            if expires_ok:
                 return cached
             # Token is expired or within the refresh buffer — clear and refresh
             self._cached_copilot_token = None
@@ -533,8 +535,9 @@ class ChatGithubCopilot(BaseChatModel):
                 cached = getattr(self, "_cached_copilot_token", None)
                 if cached:
                     return cached
-            except (httpx.NetworkError, httpx.TimeoutException, OSError) as exc:
-                # Network unavailable or other transient error — use raw token
+            except Exception as exc:
+                # Network unavailable, socket blocked, or other transient error.
+                # Fall back to using the raw GitHub token directly.
                 logger.debug(
                     "Token exchange failed (will use raw GitHub token): %s", exc
                 )

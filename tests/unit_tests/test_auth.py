@@ -15,7 +15,6 @@ from langchain_githubcopilot_chat.auth import (
     save_tokens_to_cache,
 )
 
-
 # ---------------------------------------------------------------------------
 # Threading lock type
 # ---------------------------------------------------------------------------
@@ -32,7 +31,7 @@ def test_sync_lock_is_threading_lock() -> None:
 
 
 def test_save_tokens_logs_on_oserror(caplog: pytest.LogCaptureFixture) -> None:
-    """OSError during cache save should be logged as a warning, not silently swallowed."""
+    """OSError during cache save should be logged as a warning."""
     import logging
 
     with caplog.at_level(logging.WARNING, logger="langchain_githubcopilot_chat.auth"):

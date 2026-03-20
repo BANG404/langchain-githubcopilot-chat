@@ -3,19 +3,18 @@
 import threading
 import time
 from typing import Type
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_tests.unit_tests import ChatModelUnitTests
 
+import langchain_githubcopilot_chat.auth as _auth_module
 from langchain_githubcopilot_chat.chat_models import (
     ChatGithubCopilot,
     ChatGithubcopilotChat,
-    _TOKEN_REFRESH_BUFFER_SECS,
 )
-import langchain_githubcopilot_chat.auth as _auth_module
 
 # ---------------------------------------------------------------------------
 # Standard LangChain unit test suite
@@ -582,7 +581,7 @@ def test_token_expired_triggers_refresh(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 def test_token_cache_load_stores_expires_at(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Loading a copilot_token from file cache should populate _cached_copilot_token_expires_at."""
+    """Loading a copilot_token from file cache should populate expires_at."""
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     future_exp = time.time() + 7200.0
 
@@ -635,9 +634,13 @@ def test_retry_backoff_jitter_sync(monkeypatch: pytest.MonkeyPatch) -> None:
         call_count += 1
         raise httpx.TransportError("connection reset")
 
-    with patch("httpx.post", side_effect=fake_post), patch(
+    uniform_patch = patch(
+        "langchain_githubcopilot_chat.chat_models.random.uniform", return_value=0.1
+    )
+    sleep_patch = patch(
         "langchain_githubcopilot_chat.chat_models.time.sleep", side_effect=fake_sleep
-    ), patch("langchain_githubcopilot_chat.chat_models.random.uniform", return_value=0.1):
+    )
+    with patch("httpx.post", side_effect=fake_post), sleep_patch, uniform_patch:
         with pytest.raises(httpx.TransportError):
             llm._do_request({"model": "openai/gpt-4.1", "messages": []})
 
@@ -666,10 +669,15 @@ async def test_retry_backoff_jitter_async(monkeypatch: pytest.MonkeyPatch) -> No
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
 
-    with patch("httpx.AsyncClient", return_value=mock_client), patch(
+    async_uniform_patch = patch(
+        "langchain_githubcopilot_chat.chat_models.random.uniform", return_value=0.1
+    )
+    async_sleep_patch = patch(
         "langchain_githubcopilot_chat.chat_models.asyncio.sleep",
         side_effect=fake_async_sleep,
-    ), patch("langchain_githubcopilot_chat.chat_models.random.uniform", return_value=0.1):
+    )
+    with patch("httpx.AsyncClient", return_value=mock_client), \
+            async_sleep_patch, async_uniform_patch:
         with pytest.raises(httpx.TransportError):
             await llm._do_request_async({"model": "openai/gpt-4.1", "messages": []})
 
