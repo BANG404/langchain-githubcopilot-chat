@@ -1,8 +1,11 @@
 """Unit tests for ChatGithubCopilot chat model."""
 
+import threading
+import time
 from typing import Type
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_tests.unit_tests import ChatModelUnitTests
@@ -10,7 +13,9 @@ from langchain_tests.unit_tests import ChatModelUnitTests
 from langchain_githubcopilot_chat.chat_models import (
     ChatGithubCopilot,
     ChatGithubcopilotChat,
+    _TOKEN_REFRESH_BUFFER_SECS,
 )
+import langchain_githubcopilot_chat.auth as _auth_module
 
 # ---------------------------------------------------------------------------
 # Standard LangChain unit test suite
@@ -505,3 +510,184 @@ def test_identifying_params() -> None:
     assert params["model_name"] == "openai/gpt-4.1"
     assert params["temperature"] == 0.7
     assert params["max_tokens"] == 512
+
+
+# ---------------------------------------------------------------------------
+# threading.Lock for sync token refresh
+# ---------------------------------------------------------------------------
+
+
+def test_sync_token_refresh_lock_is_threading_lock() -> None:
+    """_sync_token_refresh_lock in auth must be a real threading.Lock."""
+    assert isinstance(_auth_module._sync_token_refresh_lock, type(threading.Lock()))
+
+
+def test_refresh_token_sync_skips_when_lock_held(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_refresh_token_sync should return immediately if the lock is already held."""
+    llm = ChatGithubCopilot(model="openai/gpt-4.1", github_token="ghp_tok")
+
+    acquired = _auth_module._sync_token_refresh_lock.acquire(blocking=True)
+    try:
+        # Lock is held — _refresh_token_sync should return without modifying the token
+        llm._refresh_token_sync("ghp_tok")
+        assert llm._cached_copilot_token is None  # no update occurred
+    finally:
+        _auth_module._sync_token_refresh_lock.release()
+    assert acquired  # sanity check
+
+
+# ---------------------------------------------------------------------------
+# Token expiry pre-check
+# ---------------------------------------------------------------------------
+
+
+def test_token_cached_and_not_expired_is_returned_directly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    llm = ChatGithubCopilot(model="openai/gpt-4.1", github_token="ghp_tok")
+    llm._cached_copilot_token = "copilot_valid"
+    llm._cached_copilot_token_expires_at = time.time() + 3600  # valid for 1 hour
+    assert llm._token == "copilot_valid"
+
+
+def test_token_within_buffer_triggers_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    llm = ChatGithubCopilot(model="openai/gpt-4.1", github_token="ghp_tok")
+    llm._cached_copilot_token = "copilot_stale"
+    # Expires in 30s — within the 60s buffer
+    llm._cached_copilot_token_expires_at = time.time() + 30
+
+    with patch.object(llm, "_refresh_token_sync") as mock_refresh:
+        _ = llm._token
+    mock_refresh.assert_called_once()
+    # Cached token was cleared
+    assert llm._cached_copilot_token is None
+
+
+def test_token_expired_triggers_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    llm = ChatGithubCopilot(model="openai/gpt-4.1", github_token="ghp_tok")
+    llm._cached_copilot_token = "copilot_old"
+    llm._cached_copilot_token_expires_at = time.time() - 10  # already expired
+
+    with patch.object(llm, "_refresh_token_sync") as mock_refresh:
+        _ = llm._token
+    mock_refresh.assert_called_once()
+    assert llm._cached_copilot_token is None
+
+
+def test_token_cache_load_stores_expires_at(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Loading a copilot_token from file cache should populate _cached_copilot_token_expires_at."""
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    future_exp = time.time() + 7200.0
+
+    cache_data = {
+        "copilot_token": "copilot_cached",
+        "expires_at": future_exp,
+    }
+
+    llm = ChatGithubCopilot(model="openai/gpt-4.1", github_token="ghp_tok")
+    # Force the copilot-token-from-cache path: clear cached token and github_token
+    llm._cached_copilot_token = None
+    llm._cached_copilot_token_expires_at = None
+    # Temporarily clear github_token so _token falls through to load_tokens_from_cache
+    original_github_token = llm.github_token
+    object.__setattr__(llm, "github_token", None)
+
+    with patch(
+        "langchain_githubcopilot_chat.chat_models.load_tokens_from_cache",
+        return_value=cache_data,
+    ), monkeypatch.context() as m:
+        m.delenv("GITHUB_TOKEN", raising=False)
+        tok = llm._token
+
+    # Restore
+    object.__setattr__(llm, "github_token", original_github_token)
+
+    assert tok == "copilot_cached"
+    assert llm._cached_copilot_token_expires_at == future_exp
+
+
+# ---------------------------------------------------------------------------
+# Retry backoff jitter
+# ---------------------------------------------------------------------------
+
+
+def test_retry_backoff_jitter_sync(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sync retry should sleep with jitter on transient failures."""
+    llm = ChatGithubCopilot(
+        model="openai/gpt-4.1", github_token="tok", max_retries=1
+    )
+    sleep_calls: list = []
+
+    def fake_sleep(secs: float) -> None:
+        sleep_calls.append(secs)
+
+    call_count = 0
+
+    def fake_post(*args: object, **kwargs: object) -> object:
+        nonlocal call_count
+        call_count += 1
+        raise httpx.TransportError("connection reset")
+
+    with patch("httpx.post", side_effect=fake_post), patch(
+        "langchain_githubcopilot_chat.chat_models.time.sleep", side_effect=fake_sleep
+    ), patch("langchain_githubcopilot_chat.chat_models.random.uniform", return_value=0.1):
+        with pytest.raises(httpx.TransportError):
+            llm._do_request({"model": "openai/gpt-4.1", "messages": []})
+
+    # sleep was called once (after first attempt, before second)
+    assert len(sleep_calls) == 1
+    # base backoff is 2**0 = 1; jitter is 0.1 → total 1.1
+    assert sleep_calls[0] == pytest.approx(1.1)
+
+
+@pytest.mark.asyncio
+async def test_retry_backoff_jitter_async(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Async retry should sleep with jitter on transient failures."""
+    llm = ChatGithubCopilot(
+        model="openai/gpt-4.1", github_token="tok", max_retries=1
+    )
+    sleep_calls: list = []
+
+    async def fake_async_sleep(secs: float) -> None:
+        sleep_calls.append(secs)
+
+    async def fake_post(*args: object, **kwargs: object) -> object:
+        raise httpx.TransportError("connection reset")
+
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(side_effect=httpx.TransportError("connection reset"))
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("httpx.AsyncClient", return_value=mock_client), patch(
+        "langchain_githubcopilot_chat.chat_models.asyncio.sleep",
+        side_effect=fake_async_sleep,
+    ), patch("langchain_githubcopilot_chat.chat_models.random.uniform", return_value=0.1):
+        with pytest.raises(httpx.TransportError):
+            await llm._do_request_async({"model": "openai/gpt-4.1", "messages": []})
+
+    assert len(sleep_calls) == 1
+    assert sleep_calls[0] == pytest.approx(1.1)
+
+
+# ---------------------------------------------------------------------------
+# _make_usage_chunk deduplication helper
+# ---------------------------------------------------------------------------
+
+
+def test_make_usage_chunk_fields() -> None:
+    usage = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+    chunk = ChatGithubCopilot._make_usage_chunk(usage)
+    assert chunk.message.content == ""
+    assert chunk.message.usage_metadata is not None
+    assert chunk.message.usage_metadata["input_tokens"] == 10
+    assert chunk.message.usage_metadata["output_tokens"] == 5
+    assert chunk.message.usage_metadata["total_tokens"] == 15
+    assert chunk.message.response_metadata["usage"] == usage

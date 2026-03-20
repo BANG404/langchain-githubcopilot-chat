@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import threading
 import time
 from typing import Callable, Dict, Optional, Tuple, Union
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 CLIENT_ID = "Iv1.b507a08c87ecfe98"
 CACHE_PATH = os.path.expanduser("~/.github-copilot-chat.json")
@@ -31,7 +35,7 @@ COPILOT_DEFAULT_HEADERS = {
 
 # In-memory lock for token refresh to prevent concurrent refresh attempts
 _token_refresh_lock: Optional[asyncio.Lock] = None
-_sync_token_refresh_lock: bool = False
+_sync_token_refresh_lock: threading.Lock = threading.Lock()
 
 
 def _get_token_refresh_lock() -> asyncio.Lock:
@@ -59,8 +63,8 @@ def save_tokens_to_cache(
                 f,
                 indent=2,
             )
-    except Exception:
-        pass
+    except OSError as exc:
+        logger.warning("Failed to save Copilot token cache to %s: %s", CACHE_PATH, exc)
 
 
 def load_tokens_from_cache() -> Dict[str, str]:
@@ -74,7 +78,12 @@ def load_tokens_from_cache() -> Dict[str, str]:
                     # Token expired, return empty
                     return {}
             return data
-    except Exception:
+    except FileNotFoundError:
+        return {}  # cache doesn't exist yet — silently OK
+    except (OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
+        logger.warning(
+            "Failed to load Copilot token cache from %s: %s", CACHE_PATH, exc
+        )
         return {}
 
 

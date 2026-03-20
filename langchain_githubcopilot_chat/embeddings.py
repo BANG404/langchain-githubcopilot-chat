@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
+import random
+import time
 from typing import Any, Dict, List, Optional, Union
 
 import httpx
@@ -211,6 +214,9 @@ class GithubcopilotChatEmbeddings(BaseModel, Embeddings):
                 last_exc = exc
                 if attempt == self.max_retries:
                     raise
+            if attempt < self.max_retries:
+                backoff = 2**attempt
+                time.sleep(backoff + random.uniform(0, backoff * 0.25))
         raise RuntimeError("Unexpected retry loop exit") from last_exc
 
     async def _do_request_async(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -237,6 +243,9 @@ class GithubcopilotChatEmbeddings(BaseModel, Embeddings):
                     last_exc = exc
                     if attempt == self.max_retries:
                         raise
+                if attempt < self.max_retries:
+                    backoff = 2**attempt
+                    await asyncio.sleep(backoff + random.uniform(0, backoff * 0.25))
         raise RuntimeError("Unexpected retry loop exit") from last_exc
 
     @staticmethod

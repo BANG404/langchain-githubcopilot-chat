@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
+import random
+import threading
+import time
 from typing import (
     Any,
     AsyncIterator,
@@ -47,14 +52,17 @@ from pydantic import Field, PrivateAttr, SecretStr, model_validator
 from langchain_githubcopilot_chat.auth import (
     COPILOT_DEFAULT_HEADERS,
     _get_token_refresh_lock,
+    _sync_token_refresh_lock,
     afetch_copilot_token,
     fetch_copilot_token,
     load_tokens_from_cache,
     save_tokens_to_cache,
 )
 
-# Synchronous lock for token refresh (module-level global)
-_sync_token_refresh_lock: bool = False
+logger = logging.getLogger(__name__)
+
+# Buffer (seconds) before token expiry to trigger a proactive refresh
+_TOKEN_REFRESH_BUFFER_SECS: int = 60
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -453,6 +461,7 @@ class ChatGithubCopilot(BaseChatModel):
     # ------------------------------------------------------------------
 
     _cached_copilot_token: Optional[str] = PrivateAttr(default=None)
+    _cached_copilot_token_expires_at: Optional[float] = PrivateAttr(default=None)
 
     @model_validator(mode="before")
     @classmethod
@@ -486,8 +495,13 @@ class ChatGithubCopilot(BaseChatModel):
         # Use getattr to avoid triggering Pydantic's __getattr__ on PrivateAttr
         # when instance is created via __new__ without proper initialization
         cached = getattr(self, "_cached_copilot_token", None)
+        cached_exp = getattr(self, "_cached_copilot_token_expires_at", None)
         if cached:
-            return cached
+            if cached_exp is None or time.time() < cached_exp - _TOKEN_REFRESH_BUFFER_SECS:
+                return cached
+            # Token is expired or within the refresh buffer — clear and refresh
+            self._cached_copilot_token = None
+            self._cached_copilot_token_expires_at = None
 
         token = None
         if self.github_token:
@@ -498,6 +512,7 @@ class ChatGithubCopilot(BaseChatModel):
             tokens = load_tokens_from_cache()
             if "copilot_token" in tokens:
                 self._cached_copilot_token = tokens["copilot_token"]
+                self._cached_copilot_token_expires_at = tokens.get("expires_at")
                 return tokens["copilot_token"]
             elif "github_token" in tokens:
                 token = tokens["github_token"]
@@ -518,18 +533,18 @@ class ChatGithubCopilot(BaseChatModel):
                 cached = getattr(self, "_cached_copilot_token", None)
                 if cached:
                     return cached
-            except Exception:
-                # Network unavailable or other error - use GitHub token directly
-                pass
+            except (httpx.NetworkError, httpx.TimeoutException, OSError) as exc:
+                # Network unavailable or other transient error — use raw token
+                logger.debug(
+                    "Token exchange failed (will use raw GitHub token): %s", exc
+                )
 
         return token
 
     def _refresh_token_sync(self, github_token: Optional[str] = None) -> None:
-        # Use lock to prevent concurrent token refresh
-        global _sync_token_refresh_lock
-        if _sync_token_refresh_lock:
+        # Non-blocking acquire: if another thread is already refreshing, skip
+        if not _sync_token_refresh_lock.acquire(blocking=False):
             return
-        _sync_token_refresh_lock = True
         try:
             token_to_use = github_token or (
                 self.github_token.get_secret_value() if self.github_token else None
@@ -542,9 +557,10 @@ class ChatGithubCopilot(BaseChatModel):
                 new_token, expires_at = fetch_copilot_token(token_to_use)
                 if new_token:
                     self._cached_copilot_token = new_token
+                    self._cached_copilot_token_expires_at = expires_at
                     save_tokens_to_cache(token_to_use, new_token, expires_at)
         finally:
-            _sync_token_refresh_lock = False
+            _sync_token_refresh_lock.release()
 
     async def _refresh_token_async(self, github_token: Optional[str] = None) -> None:
         lock = _get_token_refresh_lock()
@@ -560,6 +576,7 @@ class ChatGithubCopilot(BaseChatModel):
                 new_token, expires_at = await afetch_copilot_token(token_to_use)
                 if new_token:
                     self._cached_copilot_token = new_token
+                    self._cached_copilot_token_expires_at = expires_at
                     save_tokens_to_cache(token_to_use, new_token, expires_at)
 
     @property
@@ -656,8 +673,6 @@ class ChatGithubCopilot(BaseChatModel):
 
     def _do_request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Perform a synchronous (non-streaming) HTTP POST with retries."""
-        import time
-
         headers = self._build_headers()
         last_exc: Optional[Exception] = None
         for attempt in range(self.max_retries + 1):
@@ -693,7 +708,8 @@ class ChatGithubCopilot(BaseChatModel):
                 if attempt == self.max_retries:
                     raise
             if attempt < self.max_retries:
-                time.sleep(2**attempt)
+                backoff = 2**attempt
+                time.sleep(backoff + random.uniform(0, backoff * 0.25))
         raise RuntimeError("Unexpected retry loop exit") from last_exc
 
     def _do_stream(self, payload: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
@@ -720,8 +736,6 @@ class ChatGithubCopilot(BaseChatModel):
 
     async def _do_request_async(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Perform an asynchronous (non-streaming) HTTP POST with retries."""
-        import asyncio
-
         headers = self._build_headers()
         last_exc: Optional[Exception] = None
         async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -755,7 +769,8 @@ class ChatGithubCopilot(BaseChatModel):
                     if attempt == self.max_retries:
                         raise
                 if attempt < self.max_retries:
-                    await asyncio.sleep(2**attempt)
+                    backoff = 2**attempt
+                    await asyncio.sleep(backoff + random.uniform(0, backoff * 0.25))
         raise RuntimeError("Unexpected retry loop exit") from last_exc
 
     async def _do_stream_async(
@@ -833,6 +848,21 @@ class ChatGithubCopilot(BaseChatModel):
             usage_metadata=usage_metadata,
         )
 
+    @staticmethod
+    def _make_usage_chunk(usage: Dict[str, Any]) -> ChatGenerationChunk:
+        """Build a usage-only final ``ChatGenerationChunk`` from a usage dict."""
+        return ChatGenerationChunk(
+            message=AIMessageChunk(
+                content="",
+                usage_metadata=UsageMetadata(
+                    input_tokens=usage.get("prompt_tokens", 0),
+                    output_tokens=usage.get("completion_tokens", 0),
+                    total_tokens=usage.get("total_tokens", 0),
+                ),
+                response_metadata={"usage": usage},
+            )
+        )
+
     # ------------------------------------------------------------------
     # LangChain BaseChatModel interface
     # ------------------------------------------------------------------
@@ -907,17 +937,7 @@ class ChatGithubCopilot(BaseChatModel):
 
             if not choices and usage:
                 # Final usage-only chunk
-                chunk = ChatGenerationChunk(
-                    message=AIMessageChunk(
-                        content="",
-                        usage_metadata=UsageMetadata(
-                            input_tokens=usage.get("prompt_tokens", 0),
-                            output_tokens=usage.get("completion_tokens", 0),
-                            total_tokens=usage.get("total_tokens", 0),
-                        ),
-                        response_metadata={"usage": usage},
-                    )
-                )
+                chunk = self._make_usage_chunk(usage)
                 if run_manager:
                     run_manager.on_llm_new_token("", chunk=chunk)
                 yield chunk
@@ -973,17 +993,7 @@ class ChatGithubCopilot(BaseChatModel):
             usage = raw_chunk.get("usage")
 
             if not choices and usage:
-                chunk = ChatGenerationChunk(
-                    message=AIMessageChunk(
-                        content="",
-                        usage_metadata=UsageMetadata(
-                            input_tokens=usage.get("prompt_tokens", 0),
-                            output_tokens=usage.get("completion_tokens", 0),
-                            total_tokens=usage.get("total_tokens", 0),
-                        ),
-                        response_metadata={"usage": usage},
-                    )
-                )
+                chunk = self._make_usage_chunk(usage)
                 if run_manager:
                     await run_manager.on_llm_new_token("", chunk=chunk)
                 yield chunk
