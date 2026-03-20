@@ -506,11 +506,17 @@ class ChatGithubCopilot(BaseChatModel):
                 "to authenticate."
             )
 
-        # If the token is a standard GitHub token, exchange it
+        # If the token is a standard GitHub token, try to exchange it
+        # for a Copilot token. This may fail in environments without
+        # network access (e.g., CI), so we catch exceptions.
         if token.startswith(("gho_", "ghp_", "ghu_")):
-            self._refresh_token_sync(token)
-            if self._cached_copilot_token:
-                return self._cached_copilot_token
+            try:
+                self._refresh_token_sync(token)
+                if self._cached_copilot_token:
+                    return self._cached_copilot_token
+            except Exception:
+                # Network unavailable or other error - use GitHub token directly
+                pass
 
         return token
 
