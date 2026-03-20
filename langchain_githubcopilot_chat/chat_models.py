@@ -819,7 +819,9 @@ class ChatGithubCopilot(BaseChatModel):
                         if response.status_code == 401:
                             await self._refresh_token_async()
                             headers = self._build_headers()
-                            raise httpx.TransportError("401 — token refreshed, retrying")
+                            raise httpx.TransportError(
+                                "401 — token refreshed, retrying"
+                            )
                         response.raise_for_status()
                         async for line in response.aiter_lines():
                             line = line.strip()
