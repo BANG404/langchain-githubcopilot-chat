@@ -721,24 +721,46 @@ class ChatGithubCopilot(BaseChatModel):
     def _do_stream(self, payload: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
         """Perform a synchronous streaming HTTP POST and yield parsed SSE chunks."""
         headers = self._build_headers()
-        with httpx.stream(
-            "POST",
-            self._inference_url,
-            headers=headers,
-            json=payload,
-            timeout=self.timeout,
-        ) as response:
-            response.raise_for_status()
-            for line in response.iter_lines():
-                line = line.strip()
-                if not line or line == "data: [DONE]":
-                    continue
-                if line.startswith("data: "):
-                    line = line[len("data: ") :]
-                try:
-                    yield json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+        last_exc: Optional[Exception] = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                with httpx.stream(
+                    "POST",
+                    self._inference_url,
+                    headers=headers,
+                    json=payload,
+                    timeout=self.timeout,
+                ) as response:
+                    if response.status_code == 401:
+                        self._refresh_token_sync()
+                        headers = self._build_headers()
+                        raise httpx.TransportError("401 — token refreshed, retrying")
+                    response.raise_for_status()
+                    for line in response.iter_lines():
+                        line = line.strip()
+                        if not line or line == "data: [DONE]":
+                            continue
+                        if line.startswith("data: "):
+                            line = line[len("data: ") :]
+                        try:
+                            yield json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                    return
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                last_exc = exc
+                if attempt == self.max_retries:
+                    raise
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code < 500:
+                    raise
+                last_exc = exc
+                if attempt == self.max_retries:
+                    raise
+            if attempt < self.max_retries:
+                backoff = 2**attempt
+                time.sleep(backoff + random.uniform(0, backoff * 0.25))
+        raise RuntimeError("Unexpected retry loop exit") from last_exc
 
     async def _do_request_async(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Perform an asynchronous (non-streaming) HTTP POST with retries."""
@@ -784,24 +806,46 @@ class ChatGithubCopilot(BaseChatModel):
     ) -> AsyncIterator[Dict[str, Any]]:
         """Perform an asynchronous streaming HTTP POST and yield parsed SSE chunks."""
         headers = self._build_headers()
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            async with client.stream(
-                "POST",
-                self._inference_url,
-                headers=headers,
-                json=payload,
-            ) as response:
-                response.raise_for_status()
-                async for line in response.aiter_lines():
-                    line = line.strip()
-                    if not line or line == "data: [DONE]":
-                        continue
-                    if line.startswith("data: "):
-                        line = line[len("data: ") :]
-                    try:
-                        yield json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
+        last_exc: Optional[Exception] = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    async with client.stream(
+                        "POST",
+                        self._inference_url,
+                        headers=headers,
+                        json=payload,
+                    ) as response:
+                        if response.status_code == 401:
+                            await self._refresh_token_async()
+                            headers = self._build_headers()
+                            raise httpx.TransportError("401 — token refreshed, retrying")
+                        response.raise_for_status()
+                        async for line in response.aiter_lines():
+                            line = line.strip()
+                            if not line or line == "data: [DONE]":
+                                continue
+                            if line.startswith("data: "):
+                                line = line[len("data: ") :]
+                            try:
+                                yield json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                        return
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                last_exc = exc
+                if attempt == self.max_retries:
+                    raise
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code < 500:
+                    raise
+                last_exc = exc
+                if attempt == self.max_retries:
+                    raise
+            if attempt < self.max_retries:
+                backoff = 2**attempt
+                await asyncio.sleep(backoff + random.uniform(0, backoff * 0.25))
+        raise RuntimeError("Unexpected retry loop exit") from last_exc
 
     # ------------------------------------------------------------------
     # Stream delta → AIMessageChunk helpers

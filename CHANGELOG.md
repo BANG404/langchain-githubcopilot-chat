@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-03-20
+
+### Fixed
+- `_do_stream` and `_do_stream_async` now retry on transient network errors
+  (`httpx.TimeoutException`, `httpx.TransportError` including `ReadError`) with
+  the same exponential back-off + 25 % jitter already used by `_do_request` /
+  `_do_request_async`.  Previously the streaming paths had no retry logic,
+  causing `httpx.ReadError` (connection dropped before response headers were
+  received) to surface as an unhandled exception.
+- `_do_stream` and `_do_stream_async` now handle HTTP 401 responses by
+  refreshing the GitHub Copilot token and retrying the request, consistent with
+  the non-streaming paths.
+
 ## [0.5.0] - 2026-03-20
 
 ### Added

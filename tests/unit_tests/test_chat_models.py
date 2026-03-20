@@ -3,7 +3,7 @@
 import threading
 import time
 from typing import Type
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -696,3 +696,355 @@ def test_make_usage_chunk_fields() -> None:
     assert chunk.message.usage_metadata["output_tokens"] == 5
     assert chunk.message.usage_metadata["total_tokens"] == 15
     assert chunk.message.response_metadata["usage"] == usage
+
+
+# ---------------------------------------------------------------------------
+# _do_stream retry logic (new in 0.5.1)
+# ---------------------------------------------------------------------------
+
+_STREAM_LINE = 'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}'
+
+
+def _sync_stream_cm(lines: list[str]):
+    """Return a sync context manager that yields a mock response with iter_lines."""
+    from contextlib import contextmanager
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.raise_for_status = MagicMock()
+    mock_resp.iter_lines = MagicMock(return_value=iter(lines))
+
+    @contextmanager
+    def cm():
+        yield mock_resp
+
+    return cm()
+
+
+def test_do_stream_retries_on_read_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_do_stream should retry on ReadError (a TransportError subclass)."""
+    from contextlib import contextmanager
+
+    llm = ChatGithubCopilot(model="openai/gpt-4.1", github_token="tok", max_retries=1)
+    sleep_calls: list[float] = []
+    call_count = 0
+
+    def make_stream(*args: object, **kwargs: object):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+
+            @contextmanager
+            def failing_cm():
+                raise httpx.ReadError("connection reset")
+                yield  # noqa: unreachable
+
+            return failing_cm()
+        return _sync_stream_cm([_STREAM_LINE])
+
+    with (
+        patch("httpx.stream", side_effect=make_stream),
+        patch(
+            "langchain_githubcopilot_chat.chat_models.time.sleep",
+            side_effect=lambda s: sleep_calls.append(s),
+        ),
+        patch(
+            "langchain_githubcopilot_chat.chat_models.random.uniform", return_value=0.0
+        ),
+    ):
+        chunks = list(llm._do_stream({"model": "openai/gpt-4.1", "messages": []}))
+
+    assert call_count == 2
+    assert len(sleep_calls) == 1
+    assert sleep_calls[0] == pytest.approx(1.0)  # 2**0 = 1, jitter = 0
+    assert len(chunks) == 1
+
+
+def test_do_stream_raises_after_max_retries() -> None:
+    """_do_stream should raise after exhausting max_retries."""
+    from contextlib import contextmanager
+
+    llm = ChatGithubCopilot(model="openai/gpt-4.1", github_token="tok", max_retries=1)
+
+    def make_stream(*args: object, **kwargs: object):
+        @contextmanager
+        def cm():
+            raise httpx.ReadError("persistent error")
+            yield  # noqa: unreachable
+
+        return cm()
+
+    with (
+        patch("httpx.stream", side_effect=make_stream),
+        patch("langchain_githubcopilot_chat.chat_models.time.sleep"),
+        patch(
+            "langchain_githubcopilot_chat.chat_models.random.uniform", return_value=0.0
+        ),
+    ):
+        with pytest.raises(httpx.ReadError):
+            list(llm._do_stream({"model": "openai/gpt-4.1", "messages": []}))
+
+
+def test_do_stream_does_not_retry_on_4xx() -> None:
+    """_do_stream should raise immediately on 4xx without retrying."""
+    from contextlib import contextmanager
+
+    llm = ChatGithubCopilot(model="openai/gpt-4.1", github_token="tok", max_retries=2)
+    call_count = 0
+
+    def make_stream(*args: object, **kwargs: object):
+        nonlocal call_count
+        call_count += 1
+        bad_resp = MagicMock()
+        bad_resp.status_code = 400
+        mock_http_resp = MagicMock()
+        mock_http_resp.status_code = 400
+        bad_resp.raise_for_status = MagicMock(
+            side_effect=httpx.HTTPStatusError(
+                "Bad Request", request=MagicMock(), response=mock_http_resp
+            )
+        )
+        bad_resp.iter_lines = MagicMock(return_value=iter([]))
+
+        @contextmanager
+        def cm():
+            yield bad_resp
+
+        return cm()
+
+    with patch("httpx.stream", side_effect=make_stream):
+        with pytest.raises(httpx.HTTPStatusError):
+            list(llm._do_stream({"model": "openai/gpt-4.1", "messages": []}))
+
+    assert call_count == 1  # no retry
+
+
+def test_do_stream_401_refreshes_token_and_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_do_stream should refresh token on 401 and retry the request."""
+    from contextlib import contextmanager
+
+    llm = ChatGithubCopilot(model="openai/gpt-4.1", github_token="tok", max_retries=1)
+    call_count = 0
+    refresh_calls = 0
+
+    def fake_refresh() -> None:
+        nonlocal refresh_calls
+        refresh_calls += 1
+
+    def make_stream(*args: object, **kwargs: object):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 401
+            mock_resp.raise_for_status = MagicMock()
+
+            @contextmanager
+            def cm():
+                yield mock_resp
+
+            return cm()
+        return _sync_stream_cm([_STREAM_LINE])
+
+    with (
+        patch("httpx.stream", side_effect=make_stream),
+        patch.object(llm, "_refresh_token_sync", side_effect=fake_refresh),
+        patch("langchain_githubcopilot_chat.chat_models.time.sleep"),
+        patch(
+            "langchain_githubcopilot_chat.chat_models.random.uniform", return_value=0.0
+        ),
+    ):
+        chunks = list(llm._do_stream({"model": "openai/gpt-4.1", "messages": []}))
+
+    assert refresh_calls == 1
+    assert call_count == 2
+    assert len(chunks) == 1
+
+
+# ---------------------------------------------------------------------------
+# _do_stream_async retry logic (new in 0.5.1)
+# ---------------------------------------------------------------------------
+
+
+def _make_async_client(stream_cm: object) -> AsyncMock:
+    """Build an AsyncMock AsyncClient whose .stream() returns stream_cm."""
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.stream = MagicMock(return_value=stream_cm)
+    return mock_client
+
+
+def _make_success_stream_cm() -> AsyncMock:
+    """Build a streaming context manager that yields one JSON chunk."""
+
+    async def fake_aiter_lines():
+        yield _STREAM_LINE
+
+    mock_resp = AsyncMock()
+    mock_resp.status_code = 200
+    mock_resp.raise_for_status = MagicMock()
+    mock_resp.aiter_lines = fake_aiter_lines
+    cm = AsyncMock()
+    cm.__aenter__ = AsyncMock(return_value=mock_resp)
+    cm.__aexit__ = AsyncMock(return_value=False)
+    return cm
+
+
+def _make_failing_stream_cm(exc: Exception) -> AsyncMock:
+    """Build a streaming context manager that raises exc on __aenter__."""
+    cm = AsyncMock()
+    cm.__aenter__ = AsyncMock(side_effect=exc)
+    cm.__aexit__ = AsyncMock(return_value=False)
+    return cm
+
+
+@pytest.mark.asyncio
+async def test_do_stream_async_retries_on_read_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_do_stream_async should retry on ReadError with exponential backoff."""
+    llm = ChatGithubCopilot(model="openai/gpt-4.1", github_token="tok", max_retries=1)
+    sleep_calls: list[float] = []
+    call_count = 0
+
+    def make_async_client(*args: object, **kwargs: object) -> AsyncMock:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            stream_cm = _make_failing_stream_cm(httpx.ReadError("connection reset"))
+        else:
+            stream_cm = _make_success_stream_cm()
+        return _make_async_client(stream_cm)
+
+    async def fake_sleep(secs: float) -> None:
+        sleep_calls.append(secs)
+
+    with (
+        patch("httpx.AsyncClient", side_effect=make_async_client),
+        patch(
+            "langchain_githubcopilot_chat.chat_models.asyncio.sleep",
+            side_effect=fake_sleep,
+        ),
+        patch(
+            "langchain_githubcopilot_chat.chat_models.random.uniform", return_value=0.0
+        ),
+    ):
+        chunks = [
+            c
+            async for c in llm._do_stream_async(
+                {"model": "openai/gpt-4.1", "messages": []}
+            )
+        ]
+
+    assert call_count == 2
+    assert len(sleep_calls) == 1
+    assert sleep_calls[0] == pytest.approx(1.0)
+    assert len(chunks) == 1
+
+
+@pytest.mark.asyncio
+async def test_do_stream_async_raises_after_max_retries() -> None:
+    """_do_stream_async should raise after exhausting max_retries."""
+    llm = ChatGithubCopilot(model="openai/gpt-4.1", github_token="tok", max_retries=1)
+
+    def make_async_client(*args: object, **kwargs: object) -> AsyncMock:
+        stream_cm = _make_failing_stream_cm(httpx.ReadError("persistent error"))
+        return _make_async_client(stream_cm)
+
+    with (
+        patch("httpx.AsyncClient", side_effect=make_async_client),
+        patch("langchain_githubcopilot_chat.chat_models.asyncio.sleep"),
+        patch(
+            "langchain_githubcopilot_chat.chat_models.random.uniform", return_value=0.0
+        ),
+    ):
+        with pytest.raises(httpx.ReadError):
+            _ = [
+                c
+                async for c in llm._do_stream_async(
+                    {"model": "openai/gpt-4.1", "messages": []}
+                )
+            ]
+
+
+@pytest.mark.asyncio
+async def test_do_stream_async_does_not_retry_on_4xx() -> None:
+    """_do_stream_async should raise immediately on 4xx without retrying."""
+    llm = ChatGithubCopilot(model="openai/gpt-4.1", github_token="tok", max_retries=2)
+    call_count = 0
+
+    def make_async_client(*args: object, **kwargs: object) -> AsyncMock:
+        nonlocal call_count
+        call_count += 1
+        mock_http_resp = MagicMock()
+        mock_http_resp.status_code = 400
+        mock_resp = AsyncMock()
+        mock_resp.status_code = 400
+        mock_resp.raise_for_status = MagicMock(
+            side_effect=httpx.HTTPStatusError(
+                "Bad Request", request=MagicMock(), response=mock_http_resp
+            )
+        )
+        cm = AsyncMock()
+        cm.__aenter__ = AsyncMock(return_value=mock_resp)
+        cm.__aexit__ = AsyncMock(return_value=False)
+        return _make_async_client(cm)
+
+    with patch("httpx.AsyncClient", side_effect=make_async_client):
+        with pytest.raises(httpx.HTTPStatusError):
+            _ = [
+                c
+                async for c in llm._do_stream_async(
+                    {"model": "openai/gpt-4.1", "messages": []}
+                )
+            ]
+
+    assert call_count == 1  # no retry
+
+
+@pytest.mark.asyncio
+async def test_do_stream_async_401_refreshes_token_and_retries() -> None:
+    """_do_stream_async should refresh token on 401 and retry the request."""
+    llm = ChatGithubCopilot(model="openai/gpt-4.1", github_token="tok", max_retries=1)
+    call_count = 0
+    refresh_calls = 0
+
+    async def fake_refresh_async() -> None:
+        nonlocal refresh_calls
+        refresh_calls += 1
+
+    def make_async_client(*args: object, **kwargs: object) -> AsyncMock:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            mock_resp = AsyncMock()
+            mock_resp.status_code = 401
+            mock_resp.raise_for_status = MagicMock()
+            cm = AsyncMock()
+            cm.__aenter__ = AsyncMock(return_value=mock_resp)
+            cm.__aexit__ = AsyncMock(return_value=False)
+        else:
+            cm = _make_success_stream_cm()
+        return _make_async_client(cm)
+
+    with (
+        patch("httpx.AsyncClient", side_effect=make_async_client),
+        patch.object(llm, "_refresh_token_async", side_effect=fake_refresh_async),
+        patch("langchain_githubcopilot_chat.chat_models.asyncio.sleep"),
+        patch(
+            "langchain_githubcopilot_chat.chat_models.random.uniform", return_value=0.0
+        ),
+    ):
+        chunks = [
+            c
+            async for c in llm._do_stream_async(
+                {"model": "openai/gpt-4.1", "messages": []}
+            )
+        ]
+
+    assert refresh_calls == 1
+    assert call_count == 2
+    assert len(chunks) == 1
