@@ -46,16 +46,15 @@ from pydantic import Field, PrivateAttr, SecretStr, model_validator
 
 from langchain_githubcopilot_chat.auth import (
     COPILOT_DEFAULT_HEADERS,
-    COPILOT_EDITOR_VERSION,
-    COPILOT_INTEGRATION_ID,
-    COPILOT_PLUGIN_VERSION,
-    COPILOT_USER_AGENT,
     _get_token_refresh_lock,
     afetch_copilot_token,
     fetch_copilot_token,
     load_tokens_from_cache,
     save_tokens_to_cache,
 )
+
+# Synchronous lock for token refresh (module-level global)
+_sync_token_refresh_lock: bool = False
 
 # ---------------------------------------------------------------------------
 # Helpers
