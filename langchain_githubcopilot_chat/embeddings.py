@@ -9,23 +9,12 @@ import httpx
 from langchain_core.embeddings import Embeddings
 from pydantic import BaseModel, Field, SecretStr, model_validator
 
+from langchain_githubcopilot_chat.auth import (
+    COPILOT_DEFAULT_HEADERS,
+)
+
 _GITHUB_COPILOT_BASE_URL = "https://api.githubcopilot.com"
 _EMBEDDINGS_PATH = "/embeddings"
-
-COPILOT_EDITOR_VERSION = "vscode/1.104.1"
-COPILOT_PLUGIN_VERSION = "copilot-chat/0.26.7"
-COPILOT_INTEGRATION_ID = "vscode-chat"
-COPILOT_USER_AGENT = "GitHubCopilotChat/0.26.7"
-
-COPILOT_DEFAULT_HEADERS = {
-    "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
-    "User-Agent": COPILOT_USER_AGENT,
-    "Editor-Version": COPILOT_EDITOR_VERSION,
-    "Editor-Plugin-Version": COPILOT_PLUGIN_VERSION,
-    "editor-version": COPILOT_EDITOR_VERSION,
-    "editor-plugin-version": COPILOT_PLUGIN_VERSION,
-    "copilot-vision-request": "true",
-}
 
 
 class GithubcopilotChatEmbeddings(BaseModel, Embeddings):

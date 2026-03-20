@@ -4,7 +4,7 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
 name = "langchain-githubcopilot-chat"
-version = "0.3.0"
+version = "0.4.0"
 description = "An integration package connecting GithubcopilotChat and LangChain"
 authors = ["YIhan Wu <iumm@ibat.ac.cn>"]
 readme = "README.md"

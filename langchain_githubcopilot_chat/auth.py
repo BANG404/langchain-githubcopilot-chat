@@ -1,14 +1,140 @@
+"""Authentication utilities for GitHub Copilot."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
 import time
-from typing import Callable, Optional
+from typing import Callable, Dict, Optional, Tuple, Union
 
 import httpx
 
 CLIENT_ID = "Iv1.b507a08c87ecfe98"
+CACHE_PATH = os.path.expanduser("~/.github-copilot-chat.json")
+
+# Shared Copilot headers
+COPILOT_EDITOR_VERSION = "vscode/1.104.1"
+COPILOT_PLUGIN_VERSION = "copilot-chat/0.26.7"
+COPILOT_INTEGRATION_ID = "vscode-chat"
+COPILOT_USER_AGENT = "GitHubCopilotChat/0.26.7"
+
+COPILOT_DEFAULT_HEADERS = {
+    "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
+    "User-Agent": COPILOT_USER_AGENT,
+    "Editor-Version": COPILOT_EDITOR_VERSION,
+    "Editor-Plugin-Version": COPILOT_PLUGIN_VERSION,
+    "editor-version": COPILOT_EDITOR_VERSION,
+    "editor-plugin-version": COPILOT_PLUGIN_VERSION,
+    "copilot-vision-request": "true",
+}
+
+# In-memory lock for token refresh to prevent concurrent refresh attempts
+_token_refresh_lock: Optional[asyncio.Lock] = None
+_sync_token_refresh_lock: bool = False
+
+
+def _get_token_refresh_lock() -> asyncio.Lock:
+    """Get or create the async token refresh lock."""
+    global _token_refresh_lock
+    if _token_refresh_lock is None:
+        _token_refresh_lock = asyncio.Lock()
+    return _token_refresh_lock
+
+
+def save_tokens_to_cache(
+    github_token: str,
+    copilot_token: str,
+    expires_at: Optional[float] = None,
+) -> None:
+    """Save tokens to cache with optional expiration time."""
+    try:
+        with open(CACHE_PATH, "w") as f:
+            json.dump(
+                {
+                    "github_token": github_token,
+                    "copilot_token": copilot_token,
+                    "expires_at": expires_at,
+                },
+                f,
+                indent=2,
+            )
+    except Exception:
+        pass
+
+
+def load_tokens_from_cache() -> Dict[str, str]:
+    """Load tokens from cache, checking expiration if present."""
+    try:
+        with open(CACHE_PATH, "r") as f:
+            data = json.load(f)
+            # Check if token has expired
+            if data.get("expires_at"):
+                if time.time() > data["expires_at"]:
+                    # Token expired, return empty
+                    return {}
+            return data
+    except Exception:
+        return {}
+
+
+def fetch_copilot_token(github_token: str) -> Tuple[Optional[str], Optional[float]]:
+    """Fetch copilot token and return it with expiration time.
+
+    Returns:
+        Tuple of (token, expires_at_timestamp). expires_at is None if not provided.
+    """
+    headers = {
+        "Authorization": f"token {github_token}",
+        "Accept": "application/json",
+        **COPILOT_DEFAULT_HEADERS,
+    }
+    with httpx.Client() as client:
+        res = client.get(
+            "https://api.github.com/copilot_internal/v2/token",
+            headers=headers,
+        )
+        if res.status_code == 200:
+            data = res.json()
+            token = data.get("token")
+            # Copilot tokens typically expire in a few hours
+            # The API may return 'expires_at' as a Unix timestamp
+            expires_at = data.get("expires_at")
+            return token, expires_at
+    return None, None
+
+
+async def afetch_copilot_token(
+    github_token: str,
+) -> Tuple[Optional[str], Optional[float]]:
+    """Async fetch copilot token and return it with expiration time.
+
+    Returns:
+        Tuple of (token, expires_at_timestamp). expires_at is None if not provided.
+    """
+    headers = {
+        "Authorization": f"token {github_token}",
+        "Accept": "application/json",
+        **COPILOT_DEFAULT_HEADERS,
+    }
+    async with httpx.AsyncClient() as client:
+        res = await client.get(
+            "https://api.github.com/copilot_internal/v2/token",
+            headers=headers,
+        )
+        if res.status_code == 200:
+            data = res.json()
+            token = data.get("token")
+            expires_at = data.get("expires_at")
+            return token, expires_at
+    return None, None
 
 
 def get_copilot_token(
-    client_id: str = CLIENT_ID, callback: Optional[Callable[[str], None]] = None
-) -> Optional[str]:
+    client_id: str = CLIENT_ID,
+    callback: Optional[Callable[[str], None]] = None,
+    return_both: bool = False,
+) -> Union[Optional[str], Tuple[Optional[str], Optional[str]]]:
     """
     Authenticate via GitHub Device Flow to get a Copilot Token.
     This function will block and wait for the user to complete the
@@ -75,20 +201,16 @@ def get_copilot_token(
                 return None
 
         # Exchange the standard access token for a Copilot internal token
-        copilot_res = client.get(
-            "https://api.github.com/copilot_internal/v2/token",
-            headers={
-                "Authorization": f"token {access_token}",
-                "Accept": "application/json",
-                "Editor-Version": "vscode/1.104.1",
-                "Editor-Plugin-Version": "copilot-chat/0.26.7",
-            },
-        )
+        copilot_token, expires_at = fetch_copilot_token(access_token)
 
-        if copilot_res.status_code == 200:
-            copilot_token = copilot_res.json().get("token")
+        if copilot_token:
+            save_tokens_to_cache(access_token, copilot_token, expires_at)
             _print("🎉 Successfully acquired Copilot Token!")
+            if return_both:
+                return access_token, copilot_token
             return copilot_token
         else:
-            _print(f"❌ Failed to acquire Copilot Token: {copilot_res.text}")
+            _print("❌ Failed to acquire Copilot Token!")
+            if return_both:
+                return access_token, None
             return None

@@ -42,7 +42,20 @@ from langchain_core.output_parsers.openai_tools import (
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_core.tools import BaseTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, PrivateAttr, SecretStr, model_validator
+
+from langchain_githubcopilot_chat.auth import (
+    COPILOT_DEFAULT_HEADERS,
+    COPILOT_EDITOR_VERSION,
+    COPILOT_INTEGRATION_ID,
+    COPILOT_PLUGIN_VERSION,
+    COPILOT_USER_AGENT,
+    _get_token_refresh_lock,
+    afetch_copilot_token,
+    fetch_copilot_token,
+    load_tokens_from_cache,
+    save_tokens_to_cache,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -58,21 +71,6 @@ _ROLE_MAP = {
 
 _GITHUB_COPILOT_BASE_URL = "https://api.githubcopilot.com"
 _INFERENCE_PATH = "/chat/completions"
-
-COPILOT_EDITOR_VERSION = "vscode/1.104.1"
-COPILOT_PLUGIN_VERSION = "copilot-chat/0.26.7"
-COPILOT_INTEGRATION_ID = "vscode-chat"
-COPILOT_USER_AGENT = "GitHubCopilotChat/0.26.7"
-
-COPILOT_DEFAULT_HEADERS = {
-    "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
-    "User-Agent": COPILOT_USER_AGENT,
-    "Editor-Version": COPILOT_EDITOR_VERSION,
-    "Editor-Plugin-Version": COPILOT_PLUGIN_VERSION,
-    "editor-version": COPILOT_EDITOR_VERSION,
-    "editor-plugin-version": COPILOT_PLUGIN_VERSION,
-    "copilot-vision-request": "true",
-}
 
 
 def _message_to_dict(message: BaseMessage) -> Dict[str, Any]:
@@ -206,11 +204,37 @@ def _build_ai_message(
 
     usage_metadata: Optional[UsageMetadata] = None
     if usage:
-        usage_metadata = UsageMetadata(
-            input_tokens=usage.get("prompt_tokens", 0),
-            output_tokens=usage.get("completion_tokens", 0),
-            total_tokens=usage.get("total_tokens", 0),
-        )
+        input_token_details: Dict[str, Any] = {}
+        if "prompt_tokens_details" in usage:
+            if "cached_tokens" in usage["prompt_tokens_details"]:
+                input_token_details["cache_read"] = usage["prompt_tokens_details"][
+                    "cached_tokens"
+                ]
+
+        output_token_details: Dict[str, Any] = {}
+        if "reasoning_tokens" in usage:
+            output_token_details["reasoning"] = usage["reasoning_tokens"]
+        if "completion_tokens_details" in usage:
+            if "accepted_prediction_tokens" in usage["completion_tokens_details"]:
+                output_token_details["accepted_prediction"] = usage[
+                    "completion_tokens_details"
+                ]["accepted_prediction_tokens"]
+            if "rejected_prediction_tokens" in usage["completion_tokens_details"]:
+                output_token_details["rejected_prediction"] = usage[
+                    "completion_tokens_details"
+                ]["rejected_prediction_tokens"]
+
+        kwargs = {
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+            "total_tokens": usage.get("total_tokens", 0),
+        }
+        if input_token_details:
+            kwargs["input_token_details"] = input_token_details
+        if output_token_details:
+            kwargs["output_token_details"] = output_token_details
+
+        usage_metadata = UsageMetadata(**kwargs)
 
     response_metadata: Dict[str, Any] = {
         "finish_reason": finish_reason,
@@ -455,21 +479,28 @@ class ChatGithubCopilot(BaseChatModel):
     # Validators / setup
     # ------------------------------------------------------------------
 
+    _cached_copilot_token: Optional[str] = PrivateAttr(default=None)
+
     @model_validator(mode="before")
     @classmethod
     def _validate_token(cls, values: Dict[str, Any]) -> Dict[str, Any]:
-        """Resolve the GitHub token from the environment if not supplied.
+        """Resolve the GitHub token from the environment or cache if not supplied.
 
         Priority order:
         1. Explicitly passed ``github_token``
         2. Explicitly passed ``api_key`` alias
         3. ``GITHUB_TOKEN`` environment variable
+        4. ``~/.github-copilot-chat.json`` cache file
         """
         token = values.get("github_token") or values.get("api_key")
         if not token:
             token = os.environ.get("GITHUB_TOKEN")
             if token:
                 values["github_token"] = token
+            else:
+                tokens = load_tokens_from_cache()
+                if "github_token" in tokens:
+                    values["github_token"] = tokens["github_token"]
         return values
 
     # ------------------------------------------------------------------
@@ -479,16 +510,74 @@ class ChatGithubCopilot(BaseChatModel):
     @property
     def _token(self) -> str:
         """Return the raw GitHub token string."""
+        if self._cached_copilot_token:
+            return self._cached_copilot_token
+
+        token = None
         if self.github_token:
-            return self.github_token.get_secret_value()
-        env_token = os.environ.get("GITHUB_TOKEN", "")
-        if not env_token:
+            token = self.github_token.get_secret_value()
+        elif os.environ.get("GITHUB_TOKEN"):
+            token = os.environ.get("GITHUB_TOKEN")
+        else:
+            tokens = load_tokens_from_cache()
+            if "copilot_token" in tokens:
+                self._cached_copilot_token = tokens["copilot_token"]
+                return tokens["copilot_token"]
+            elif "github_token" in tokens:
+                token = tokens["github_token"]
+
+        if not token:
             raise ValueError(
-                "A GitHub token is required.  Set the GITHUB_TOKEN environment "
-                "variable or pass ``github_token`` when instantiating "
-                "ChatGithubCopilot."
+                "A GitHub token is required. Set the GITHUB_TOKEN environment "
+                "variable, pass ``github_token``, or run ``get_copilot_token()`` "
+                "to authenticate."
             )
-        return env_token
+
+        # If the token is a standard GitHub token, exchange it
+        if token.startswith(("gho_", "ghp_", "ghu_")):
+            self._refresh_token_sync(token)
+            if self._cached_copilot_token:
+                return self._cached_copilot_token
+
+        return token
+
+    def _refresh_token_sync(self, github_token: Optional[str] = None) -> None:
+        # Use lock to prevent concurrent token refresh
+        global _sync_token_refresh_lock
+        if _sync_token_refresh_lock:
+            return
+        _sync_token_refresh_lock = True
+        try:
+            token_to_use = github_token or (
+                self.github_token.get_secret_value() if self.github_token else None
+            )
+            if not token_to_use:
+                tokens = load_tokens_from_cache()
+                token_to_use = tokens.get("github_token")
+
+            if token_to_use:
+                new_token, expires_at = fetch_copilot_token(token_to_use)
+                if new_token:
+                    self._cached_copilot_token = new_token
+                    save_tokens_to_cache(token_to_use, new_token, expires_at)
+        finally:
+            _sync_token_refresh_lock = False
+
+    async def _refresh_token_async(self, github_token: Optional[str] = None) -> None:
+        lock = _get_token_refresh_lock()
+        async with lock:
+            token_to_use = github_token or (
+                self.github_token.get_secret_value() if self.github_token else None
+            )
+            if not token_to_use:
+                tokens = load_tokens_from_cache()
+                token_to_use = tokens.get("github_token")
+
+            if token_to_use:
+                new_token, expires_at = await afetch_copilot_token(token_to_use)
+                if new_token:
+                    self._cached_copilot_token = new_token
+                    save_tokens_to_cache(token_to_use, new_token, expires_at)
 
     @property
     def _inference_url(self) -> str:
@@ -584,6 +673,8 @@ class ChatGithubCopilot(BaseChatModel):
 
     def _do_request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Perform a synchronous (non-streaming) HTTP POST with retries."""
+        import time
+
         headers = self._build_headers()
         last_exc: Optional[Exception] = None
         for attempt in range(self.max_retries + 1):
@@ -594,6 +685,18 @@ class ChatGithubCopilot(BaseChatModel):
                     json=payload,
                     timeout=self.timeout,
                 )
+
+                # Handle 401 Unauthorized for token refresh
+                if response.status_code == 401:
+                    self._refresh_token_sync()
+                    headers = self._build_headers()
+                    response = httpx.post(
+                        self._inference_url,
+                        headers=headers,
+                        json=payload,
+                        timeout=self.timeout,
+                    )
+
                 response.raise_for_status()
                 return response.json()
             except (httpx.TimeoutException, httpx.TransportError) as exc:
@@ -601,12 +704,13 @@ class ChatGithubCopilot(BaseChatModel):
                 if attempt == self.max_retries:
                     raise
             except httpx.HTTPStatusError as exc:
-                # Don't retry on 4xx client errors
                 if exc.response.status_code < 500:
                     raise
                 last_exc = exc
                 if attempt == self.max_retries:
                     raise
+            if attempt < self.max_retries:
+                time.sleep(2**attempt)
         raise RuntimeError("Unexpected retry loop exit") from last_exc
 
     def _do_stream(self, payload: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
@@ -633,6 +737,8 @@ class ChatGithubCopilot(BaseChatModel):
 
     async def _do_request_async(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Perform an asynchronous (non-streaming) HTTP POST with retries."""
+        import asyncio
+
         headers = self._build_headers()
         last_exc: Optional[Exception] = None
         async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -643,6 +749,16 @@ class ChatGithubCopilot(BaseChatModel):
                         headers=headers,
                         json=payload,
                     )
+
+                    if response.status_code == 401:
+                        await self._refresh_token_async()
+                        headers = self._build_headers()
+                        response = await client.post(
+                            self._inference_url,
+                            headers=headers,
+                            json=payload,
+                        )
+
                     response.raise_for_status()
                     return response.json()
                 except (httpx.TimeoutException, httpx.TransportError) as exc:
@@ -655,6 +771,8 @@ class ChatGithubCopilot(BaseChatModel):
                     last_exc = exc
                     if attempt == self.max_retries:
                         raise
+                if attempt < self.max_retries:
+                    await asyncio.sleep(2**attempt)
         raise RuntimeError("Unexpected retry loop exit") from last_exc
 
     async def _do_stream_async(
