@@ -1,52 +1,18 @@
-"""GitHub Copilot Chat model integration via GitHub Models inference API."""
+"""GitHub Copilot Chat model integration via the OpenAI-compatible API."""
 
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
 import os
-import random
 import time
-from typing import (
-    Any,
-    AsyncIterator,
-    Dict,
-    Iterator,
-    List,
-    Literal,
-    Optional,
-    Sequence,
-    Type,
-    Union,
-)
+from typing import Any, AsyncIterator, Dict, Iterator, List, Optional
 
 import httpx
-from langchain_core.callbacks import (
-    AsyncCallbackManagerForLLMRun,
-    CallbackManagerForLLMRun,
-)
-from langchain_core.language_models import BaseChatModel
-from langchain_core.language_models.base import LangSmithParams
-from langchain_core.messages import (
-    AIMessage,
-    AIMessageChunk,
-    BaseMessage,
-    ChatMessage,
-    HumanMessage,
-    SystemMessage,
-    ToolMessage,
-)
-from langchain_core.messages.ai import UsageMetadata
-from langchain_core.messages.tool import tool_call_chunk as create_tool_call_chunk
-from langchain_core.output_parsers.openai_tools import (
-    make_invalid_tool_call,
-    parse_tool_call,
-)
-from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
-from langchain_core.tools import BaseTool
-from langchain_core.utils.function_calling import convert_to_openai_tool
-from pydantic import Field, PrivateAttr, SecretStr, model_validator
+import openai
+from langchain_core.messages import BaseMessage
+from langchain_core.outputs import ChatGenerationChunk, ChatResult
+from langchain_openai import ChatOpenAI
+from pydantic import Field, SecretStr, model_validator
 
 from langchain_githubcopilot_chat.auth import (
     COPILOT_DEFAULT_HEADERS,
@@ -60,194 +26,42 @@ from langchain_githubcopilot_chat.auth import (
 
 logger = logging.getLogger(__name__)
 
+_GITHUB_COPILOT_BASE_URL = "https://api.githubcopilot.com"
+
 # Buffer (seconds) before token expiry to trigger a proactive refresh
 _TOKEN_REFRESH_BUFFER_SECS: int = 60
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-_ROLE_MAP = {
-    "human": "user",
-    "ai": "assistant",
-    "system": "system",
-    "developer": "developer",
-    "tool": "tool",
-}
-
-_GITHUB_COPILOT_BASE_URL = "https://api.githubcopilot.com"
-_INFERENCE_PATH = "/chat/completions"
+# GitHub token prefixes that can be exchanged for a short-lived Copilot token.
+# Copilot tokens themselves start with "tid=" and must NOT be re-exchanged.
+_EXCHANGEABLE_TOKEN_PREFIXES = ("gho_", "ghp_", "ghu_", "github_pat_")
 
 
-def _message_to_dict(message: BaseMessage) -> Dict[str, Any]:
-    """Convert a LangChain message to the GitHub Models API message format."""
-    if isinstance(message, SystemMessage):
-        return {"role": "system", "content": message.content}
-    elif isinstance(message, HumanMessage):
-        # Support multimodal content (list of content blocks)
-        if isinstance(message.content, list):
-            parts = []
-            for block in message.content:
-                if isinstance(block, dict):
-                    btype = block.get("type", "")
-                    if btype == "text":
-                        parts.append({"type": "text", "text": block["text"]})
-                    elif btype == "image_url":
-                        parts.append(
-                            {
-                                "type": "image_url",
-                                "image_url": block.get("image_url", {}),
-                            }
-                        )
-                    else:
-                        parts.append(block)
-                else:
-                    parts.append({"type": "text", "text": str(block)})
-            return {"role": "user", "content": parts}
-        return {"role": "user", "content": message.content}
-    elif isinstance(message, AIMessage):
-        msg: Dict[str, Any] = {"role": "assistant", "content": message.content or ""}
-        # Attach tool calls if present
-        if message.tool_calls:
-            msg["tool_calls"] = [
-                {
-                    "id": tc["id"],
-                    "type": "function",
-                    "function": {
-                        "name": tc["name"],
-                        "arguments": json.dumps(tc["args"]),
-                    },
-                }
-                for tc in message.tool_calls
-            ]
-        elif message.additional_kwargs.get("tool_calls"):
-            msg["tool_calls"] = message.additional_kwargs["tool_calls"]
-        return msg
-    elif isinstance(message, ToolMessage):
-        return {
-            "role": "tool",
-            "tool_call_id": message.tool_call_id,
-            "content": message.content,
-        }
-    elif isinstance(message, ChatMessage):
-        role = _ROLE_MAP.get(message.role, message.role)
-        return {"role": role, "content": message.content}
-    else:
-        # Fallback: treat as user message
-        return {"role": "user", "content": str(message.content)}
+def _is_exchangeable_github_token(token: str) -> bool:
+    """Return True if *token* should be exchanged for a Copilot token."""
+    return token.startswith(_EXCHANGEABLE_TOKEN_PREFIXES)
 
 
-def _format_tools_for_api(
-    tools: Sequence[Union[Dict[str, Any], BaseTool, Type]],
-) -> List[Dict[str, Any]]:
-    """Convert LangChain tools into the OpenAI-compatible format
-    expected by GitHub Models.
-    """
-    formatted = []
-    for tool in tools:
-        if isinstance(tool, dict) and tool.get("type") == "function":
-            formatted.append(tool)
-        else:
-            oai_tool = convert_to_openai_tool(tool)  # type: ignore[arg-type]
-            formatted.append(oai_tool)
-    return formatted
+def _is_auth_error(exc: Exception) -> bool:
+    """Return True for 401 AuthenticationError OR 400 badly-formatted-auth BadRequestError."""  # noqa: E501
+    if isinstance(exc, openai.AuthenticationError):
+        return True
+    if isinstance(exc, openai.BadRequestError):
+        msg = str(exc).lower()
+        return "authorization" in msg or "badly formatted" in msg
+    return False
 
 
-def _parse_tool_calls(
-    raw_tool_calls: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    """Parse raw API tool_calls into LangChain tool_calls format."""
-    tool_calls: List[Dict[str, Any]] = []
-    for raw in raw_tool_calls:
-        try:
-            parsed = parse_tool_call(raw, return_id=True)
-            if parsed is not None:
-                tool_calls.append(parsed)
-        except Exception as exc:
-            invalid = make_invalid_tool_call(raw, str(exc))
-            tool_calls.append(dict(invalid))
-    return tool_calls
+class ChatGithubCopilot(ChatOpenAI):
+    """GitHub Copilot Chat model via the OpenAI-compatible API.
 
-
-# GitHub Models API only accepts "auto", "required", or "none" for tool_choice.
-# LangChain internally uses "any" (equivalent to "required") and dict-style
-# {"type": "function", "function": {"name": "..."}} for specific tool forcing.
-_TOOL_CHOICE_MAP: Dict[str, str] = {
-    "any": "required",
-}
-
-
-def _normalize_tool_choice(
-    tool_choice: Any,
-) -> Union[str, Dict[str, Any]]:
-    """Normalise a tool_choice value for the GitHub Models API.
-
-    - ``"any"``  →  ``"required"``  (LangChain internal alias)
-    - dict ``{"type": "function", "function": {"name": "X"}}``  →  kept as-is
-      (the API accepts this form for forcing a specific function)
-    - any other string is passed through unchanged
-    """
-    if isinstance(tool_choice, str):
-        return _TOOL_CHOICE_MAP.get(tool_choice, tool_choice)
-    # dict form — pass through unchanged
-    return tool_choice
-
-
-def _build_ai_message(
-    choice: Dict[str, Any], usage: Optional[Dict[str, Any]]
-) -> AIMessage:
-    """Build an AIMessage from a single API response choice."""
-    msg = choice.get("message", {})
-    content: Union[str, List] = msg.get("content") or ""
-    finish_reason = choice.get("finish_reason", "")
-
-    additional_kwargs: Dict[str, Any] = {}
-    tool_calls = []
-    raw_tool_calls = msg.get("tool_calls", [])
-    if raw_tool_calls:
-        additional_kwargs["tool_calls"] = raw_tool_calls
-        tool_calls = _parse_tool_calls(raw_tool_calls)
-
-    usage_metadata: Optional[UsageMetadata] = None
-    if usage:
-        usage_metadata = UsageMetadata(
-            input_tokens=usage.get("prompt_tokens", 0),
-            output_tokens=usage.get("completion_tokens", 0),
-            total_tokens=usage.get("total_tokens", 0),
-        )
-
-    response_metadata: Dict[str, Any] = {
-        "finish_reason": finish_reason,
-    }
-    if usage:
-        response_metadata["usage"] = usage
-
-    return AIMessage(
-        content=content,
-        additional_kwargs=additional_kwargs,
-        tool_calls=tool_calls,
-        response_metadata=response_metadata,
-        usage_metadata=usage_metadata,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Main class
-# ---------------------------------------------------------------------------
-
-
-class ChatGithubCopilot(BaseChatModel):
-    """GitHub Copilot Chat model integration via the GitHub Models inference API.
-
-    GitHub Models provides access to top AI models (OpenAI GPT-4.1, DeepSeek,
-    Llama, and more) through a unified OpenAI-compatible REST API.  This class
-    wraps that API so that every model available in the GitHub Models catalog
-    can be used as a drop-in LangChain ``BaseChatModel``.
+    Uses ``langchain-openai`` under the hood, pointing at the GitHub Copilot
+    inference endpoint.  Handles GitHub token → Copilot token exchange and
+    caching automatically.
 
     Setup:
-        Install ``langchain-githubcopilot-chat`` and set the
-        ``GITHUB_TOKEN`` environment variable (a classic or fine-grained PAT
-        with the ``models: read`` scope, or a GitHub Copilot subscription token).
+        Install ``langchain-githubcopilot-chat`` and set the ``GITHUB_TOKEN``
+        environment variable (a classic or fine-grained PAT with the
+        ``models: read`` scope, or a GitHub Copilot subscription token).
 
         .. code-block:: bash
 
@@ -259,36 +73,13 @@ class ChatGithubCopilot(BaseChatModel):
             Model ID in the ``{publisher}/{model_name}`` format, e.g.
             ``"openai/gpt-4.1"`` or ``"meta/llama-3.3-70b-instruct"``.
         temperature: Optional[float]
-            Sampling temperature in ``[0, 1]``.  Higher → more creative.
+            Sampling temperature in ``[0, 1]``.
         max_tokens: Optional[int]
             Maximum number of tokens to generate.
-        top_p: Optional[float]
-            Nucleus sampling probability mass in ``[0, 1]``.
-        stop: Optional[List[str]]
-            Stop sequences.
-        frequency_penalty: Optional[float]
-            Frequency penalty in ``[-2, 2]``.
-        presence_penalty: Optional[float]
-            Presence penalty in ``[-2, 2]``.
-        seed: Optional[int]
-            Random seed for deterministic sampling (best-effort).
 
     Key init args — client params:
         github_token: Optional[SecretStr]
-            GitHub token.  Falls back to ``GITHUB_TOKEN`` env var.
-        base_url: str
-            Base URL of the GitHub Models API.
-            Defaults to ``"https://models.github.ai"``.
-        org: Optional[str]
-            Organisation login.  When set, every request is attributed to that
-            org (uses the ``/orgs/{org}/inference/chat/completions`` endpoint).
-        api_version: str
-            GitHub Models REST API version header value.
-            Defaults to ``"2026-03-10"``.
-        timeout: Optional[float]
-            HTTP request timeout in seconds.
-        max_retries: int
-            Number of automatic retries on transient errors (default ``2``).
+            GitHub token.  Falls back to the ``GITHUB_TOKEN`` env var.
 
     Instantiate:
         .. code-block:: python
@@ -299,7 +90,6 @@ class ChatGithubCopilot(BaseChatModel):
                 model="openai/gpt-4.1",
                 temperature=0,
                 max_tokens=1024,
-                # github_token="github_pat_...",  # or set GITHUB_TOKEN env var
             )
 
     Invoke:
@@ -311,7 +101,6 @@ class ChatGithubCopilot(BaseChatModel):
             ]
             ai_msg = llm.invoke(messages)
             print(ai_msg.content)
-            # "J'adore la programmation."
 
     Stream:
         .. code-block:: python
@@ -341,773 +130,354 @@ class ChatGithubCopilot(BaseChatModel):
             llm_with_tools = llm.bind_tools([GetWeather])
             ai_msg = llm_with_tools.invoke("What is the weather like in Paris?")
             print(ai_msg.tool_calls)
-            # [{'name': 'GetWeather', 'args': {'location': 'Paris, France'},
-            #   'id': '...'}]
-
-    Structured output:
-        .. code-block:: python
-
-            from typing import Optional
-            from pydantic import BaseModel, Field
-
-            class Joke(BaseModel):
-                '''Joke to tell user.'''
-                setup: str = Field(description="The setup of the joke")
-                punchline: str = Field(description="The punchline to the joke")
-                rating: Optional[int] = Field(description="Funniness rating 1-10")
-
-            structured_llm = llm.with_structured_output(Joke)
-            structured_llm.invoke("Tell me a joke about cats")
-
-    JSON mode:
-        .. code-block:: python
-
-            json_llm = llm.bind(response_format={"type": "json_object"})
-            ai_msg = json_llm.invoke(
-                "Return a JSON object with key 'numbers' and a list of 5 random ints."
-            )
-            print(ai_msg.content)
-
-    Image input:
-        .. code-block:: python
-
-            import base64, httpx
-            from langchain_core.messages import HumanMessage
-
-            image_url = "https://upload.wikimedia.org/wikipedia/commons/thumb/d/dd/Gfp-wisconsin-madison-the-nature-boardwalk.jpg/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg"
-            image_data = base64.b64encode(httpx.get(image_url).content).decode("utf-8")
-            message = HumanMessage(
-                content=[
-                    {"type": "text", "text": "Describe the weather in this image."},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{image_data}"},
-                    },
-                ]
-            )
-            ai_msg = llm.invoke([message])
-            print(ai_msg.content)
-
-    Token usage:
-        .. code-block:: python
-
-            ai_msg = llm.invoke(messages)
-            print(ai_msg.usage_metadata)
-            # {'input_tokens': 28, 'output_tokens': 18, 'total_tokens': 46}
-
-    Response metadata:
-        .. code-block:: python
-
-            ai_msg = llm.invoke(messages)
-            print(ai_msg.response_metadata)
-            # {'finish_reason': 'stop', 'usage': {'prompt_tokens': 28, ...}}
-    """
-
-    # ------------------------------------------------------------------
-    # Fields
-    # ------------------------------------------------------------------
-
-    model_name: str = Field(alias="model")
-    """Model ID in the ``{publisher}/{model_name}`` format.
-
-    Examples: ``"openai/gpt-4.1"``, ``"meta/llama-3.3-70b-instruct"``.
     """
 
     github_token: Optional[SecretStr] = Field(default=None)
     """GitHub token with ``models: read`` scope.
 
     If not provided, the value of the ``GITHUB_TOKEN`` environment variable
-    is used.
+    is used and automatically exchanged for a short-lived Copilot token.
     """
-
-    base_url: str = _GITHUB_COPILOT_BASE_URL
-    """Base URL for the GitHub Copilot API."""
-
-    temperature: Optional[float] = None
-    """Sampling temperature in ``[0, 1]``."""
-
-    max_tokens: Optional[int] = None
-    """Maximum number of tokens to generate."""
-
-    top_p: Optional[float] = None
-    """Nucleus sampling probability mass in ``[0, 1]``."""
-
-    stop: Optional[List[str]] = None
-    """Stop sequences that terminate generation."""
-
-    frequency_penalty: Optional[float] = None
-    """Frequency penalty in ``[-2, 2]``."""
-
-    presence_penalty: Optional[float] = None
-    """Presence penalty in ``[-2, 2]``."""
-
-    seed: Optional[int] = None
-    """Random seed for (best-effort) deterministic sampling."""
-
-    timeout: Optional[float] = None
-    """HTTP request timeout in seconds."""
-
-    max_retries: int = 2
-    """Number of automatic retries on transient errors."""
-
-    # ------------------------------------------------------------------
-    # Pydantic v2 config — allow the ``model`` alias on construction
-    # ------------------------------------------------------------------
-    model_config = {"populate_by_name": True}
-
-    # ------------------------------------------------------------------
-    # Validators / setup
-    # ------------------------------------------------------------------
-
-    _cached_copilot_token: Optional[str] = PrivateAttr(default=None)
-    _cached_copilot_token_expires_at: Optional[float] = PrivateAttr(default=None)
 
     @model_validator(mode="before")
     @classmethod
-    def _validate_token(cls, values: Dict[str, Any]) -> Dict[str, Any]:
-        """Resolve the GitHub token from the environment or cache if not supplied.
+    def _setup_copilot_auth(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+        """Resolve credentials and configure OpenAI-compatible fields.
 
-        Priority order:
+        Priority order for the GitHub token:
         1. Explicitly passed ``github_token``
-        2. Explicitly passed ``api_key`` alias
-        3. ``GITHUB_TOKEN`` environment variable
-        4. ``~/.github-copilot-chat.json`` cache file
+        2. ``GITHUB_TOKEN`` environment variable
+        3. ``~/.github-copilot-chat.json`` cache file
+
+        If the resolved token is a standard GitHub OAuth/PAT token it is
+        exchanged for a short-lived Copilot token (cached to disk).
         """
-        token = values.get("github_token") or values.get("api_key")
-        if not token:
-            token = os.environ.get("GITHUB_TOKEN")
-            if token:
-                values["github_token"] = token
-            else:
-                tokens = load_tokens_from_cache()
-                if "github_token" in tokens:
-                    values["github_token"] = tokens["github_token"]
-        return values
+        # 1. Resolve raw GitHub token
+        github_token = values.get("github_token") or os.environ.get("GITHUB_TOKEN")
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+        if not github_token:
+            cached = load_tokens_from_cache()
+            github_token = cached.get("github_token")
 
-    @property
-    def _token(self) -> str:
-        """Return the raw GitHub token string."""
-        # Use getattr to avoid triggering Pydantic's __getattr__ on PrivateAttr
-        # when instance is created via __new__ without proper initialization
-        cached = getattr(self, "_cached_copilot_token", None)
-        cached_exp = getattr(self, "_cached_copilot_token_expires_at", None)
-        if cached:
-            expires_ok = cached_exp is None or (
-                time.time() < cached_exp - _TOKEN_REFRESH_BUFFER_SECS
+        # 2. Get/exchange for a Copilot token
+        api_token: Optional[str] = None
+
+        if github_token:
+            github_token_str = (
+                github_token.get_secret_value()
+                if hasattr(github_token, "get_secret_value")
+                else str(github_token)
             )
-            if expires_ok:
-                return cached
-            # Token is expired or within the refresh buffer — clear and refresh
-            self._cached_copilot_token = None
-            self._cached_copilot_token_expires_at = None
 
-        token = None
-        if self.github_token:
-            token = self.github_token.get_secret_value()
-        elif os.environ.get("GITHUB_TOKEN"):
-            token = os.environ.get("GITHUB_TOKEN")
-        else:
-            tokens = load_tokens_from_cache()
-            if "copilot_token" in tokens:
-                self._cached_copilot_token = tokens["copilot_token"]
-                raw_exp = tokens.get("expires_at")
-                self._cached_copilot_token_expires_at = (
-                    float(raw_exp) if raw_exp is not None else None
-                )
-                return tokens["copilot_token"]
-            elif "github_token" in tokens:
-                token = tokens["github_token"]
+            # Always persist the resolved github_token so _refresh_copilot_token
+            # can use it even when the original token came from the file cache.
+            values["github_token"] = github_token_str
 
-        if not token:
+            # Try cached Copilot token first
+            cached = load_tokens_from_cache()
+            cached_token = cached.get("copilot_token")
+            cached_exp = cached.get("expires_at")
+
+            if cached_token and (
+                cached_exp is None
+                or time.time() < float(cached_exp) - _TOKEN_REFRESH_BUFFER_SECS
+            ):
+                api_token = cached_token
+            elif _is_exchangeable_github_token(github_token_str):
+                # Exchange GitHub token for a Copilot token
+                new_token, expires_at = fetch_copilot_token(github_token_str)
+                if new_token:
+                    save_tokens_to_cache(github_token_str, new_token, expires_at)
+                    api_token = new_token
+
+            if not api_token:
+                # Fall back to using the raw token (e.g. fine-grained PATs,
+                # enterprise tokens, or environments without network access).
+                api_token = github_token_str
+
+        if not api_token:
             raise ValueError(
                 "A GitHub token is required. Set the GITHUB_TOKEN environment "
                 "variable, pass ``github_token``, or run ``get_copilot_token()`` "
                 "to authenticate."
             )
 
-        # If the token is a standard GitHub token, try to exchange it
-        # for a Copilot token. This may fail in environments without
-        # network access (e.g., CI), so we catch exceptions.
-        if token.startswith(("gho_", "ghp_", "ghu_")):
-            try:
-                self._refresh_token_sync(token)
-                cached = getattr(self, "_cached_copilot_token", None)
-                if cached:
-                    return cached
-            except Exception as exc:
-                # Network unavailable, socket blocked, or other transient error.
-                # Fall back to using the raw GitHub token directly.
-                logger.debug(
-                    "Token exchange failed (will use raw GitHub token): %s", exc
-                )
+        # 3. Configure the underlying ChatOpenAI fields
+        values["openai_api_key"] = api_token
+        values.setdefault("openai_api_base", _GITHUB_COPILOT_BASE_URL)
 
-        return token
+        # Merge Copilot-required headers with any user-supplied ones
+        user_headers: Dict[str, str] = values.get("default_headers") or {}
+        values["default_headers"] = {**COPILOT_DEFAULT_HEADERS, **user_headers}
 
-    def _refresh_token_sync(self, github_token: Optional[str] = None) -> None:
-        # Non-blocking acquire: if another thread is already refreshing, skip
-        if not _sync_token_refresh_lock.acquire(blocking=False):
-            return
-        try:
-            token_to_use = github_token or (
-                self.github_token.get_secret_value() if self.github_token else None
-            )
-            if not token_to_use:
-                tokens = load_tokens_from_cache()
-                token_to_use = tokens.get("github_token")
-
-            if token_to_use:
-                new_token, expires_at = fetch_copilot_token(token_to_use)
-                if new_token:
-                    self._cached_copilot_token = new_token
-                    self._cached_copilot_token_expires_at = expires_at
-                    save_tokens_to_cache(token_to_use, new_token, expires_at)
-        finally:
-            _sync_token_refresh_lock.release()
-
-    async def _refresh_token_async(self, github_token: Optional[str] = None) -> None:
-        lock = _get_token_refresh_lock()
-        async with lock:
-            token_to_use = github_token or (
-                self.github_token.get_secret_value() if self.github_token else None
-            )
-            if not token_to_use:
-                tokens = load_tokens_from_cache()
-                token_to_use = tokens.get("github_token")
-
-            if token_to_use:
-                new_token, expires_at = await afetch_copilot_token(token_to_use)
-                if new_token:
-                    self._cached_copilot_token = new_token
-                    self._cached_copilot_token_expires_at = expires_at
-                    save_tokens_to_cache(token_to_use, new_token, expires_at)
-
-    @property
-    def _inference_url(self) -> str:
-        """Return the full chat-completions endpoint URL."""
-        return self.base_url.rstrip("/") + _INFERENCE_PATH
-
-    def _build_headers(self) -> Dict[str, str]:
-        headers = {
-            "Authorization": f"Bearer {self._token}",
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-        }
-        headers.update(COPILOT_DEFAULT_HEADERS)
-        return headers
-
-    @classmethod
-    def get_available_models(
-        cls, github_token: Optional[str] = None
-    ) -> List[Dict[str, Any]]:
-        """Get the list of available models from the GitHub Copilot API."""
-        token = github_token or os.environ.get("GITHUB_TOKEN")
-        if not token:
-            raise ValueError(
-                "A GitHub token is required. Set the GITHUB_TOKEN environment "
-                "variable or pass ``github_token``."
-            )
-
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-        }
-        headers.update(COPILOT_DEFAULT_HEADERS)
-
-        url = f"{_GITHUB_COPILOT_BASE_URL}/models"
-
-        with httpx.Client() as client:
-            response = client.get(url, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-            return data.get("data", [])
-
-    def _build_payload(
-        self,
-        messages: List[BaseMessage],
-        stop: Optional[List[str]] = None,
-        stream: bool = False,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        """Assemble the JSON body for the inference API."""
-        payload: Dict[str, Any] = {
-            "model": self.model_name,
-            "messages": [_message_to_dict(m) for m in messages],
-            "stream": stream,
-        }
-        if stream:
-            payload["stream_options"] = {"include_usage": True}
-
-        # Optional sampling params (kwargs override instance-level defaults)
-        for field_name, api_key in [
-            ("temperature", "temperature"),
-            ("max_tokens", "max_tokens"),
-            ("top_p", "top_p"),
-            ("frequency_penalty", "frequency_penalty"),
-            ("presence_penalty", "presence_penalty"),
-            ("seed", "seed"),
-        ]:
-            value = kwargs.pop(api_key, None) or getattr(self, field_name, None)
-            if value is not None:
-                payload[api_key] = value
-
-        # Stop sequences
-        effective_stop = stop or self.stop
-        if effective_stop:
-            payload["stop"] = effective_stop
-
-        # Tools / tool_choice
-        tools = kwargs.pop("tools", None)
-        if tools:
-            payload["tools"] = _format_tools_for_api(tools)
-            tool_choice = kwargs.pop("tool_choice", None)
-            if tool_choice:
-                payload["tool_choice"] = _normalize_tool_choice(tool_choice)
-
-        # Response format (JSON mode / structured output)
-        response_format = kwargs.pop("response_format", None)
-        if response_format:
-            payload["response_format"] = response_format
-
-        # Pass through any remaining caller-supplied kwargs
-        payload.update(kwargs)
-        return payload
-
-    def _do_request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Perform a synchronous (non-streaming) HTTP POST with retries."""
-        headers = self._build_headers()
-        last_exc: Optional[Exception] = None
-        for attempt in range(self.max_retries + 1):
-            try:
-                response = httpx.post(
-                    self._inference_url,
-                    headers=headers,
-                    json=payload,
-                    timeout=self.timeout,
-                )
-
-                # Handle 401 Unauthorized for token refresh
-                if response.status_code == 401:
-                    self._refresh_token_sync()
-                    headers = self._build_headers()
-                    response = httpx.post(
-                        self._inference_url,
-                        headers=headers,
-                        json=payload,
-                        timeout=self.timeout,
-                    )
-
-                response.raise_for_status()
-                return response.json()
-            except (httpx.TimeoutException, httpx.TransportError) as exc:
-                last_exc = exc
-                if attempt == self.max_retries:
-                    raise
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code < 500:
-                    raise
-                last_exc = exc
-                if attempt == self.max_retries:
-                    raise
-            if attempt < self.max_retries:
-                backoff = 2**attempt
-                time.sleep(backoff + random.uniform(0, backoff * 0.25))
-        raise RuntimeError("Unexpected retry loop exit") from last_exc
-
-    def _do_stream(self, payload: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
-        """Perform a synchronous streaming HTTP POST and yield parsed SSE chunks."""
-        headers = self._build_headers()
-        last_exc: Optional[Exception] = None
-        for attempt in range(self.max_retries + 1):
-            try:
-                with httpx.stream(
-                    "POST",
-                    self._inference_url,
-                    headers=headers,
-                    json=payload,
-                    timeout=self.timeout,
-                ) as response:
-                    if response.status_code == 401:
-                        self._refresh_token_sync()
-                        headers = self._build_headers()
-                        raise httpx.TransportError("401 — token refreshed, retrying")
-                    response.raise_for_status()
-                    for line in response.iter_lines():
-                        line = line.strip()
-                        if not line or line == "data: [DONE]":
-                            continue
-                        if line.startswith("data: "):
-                            line = line[len("data: ") :]
-                        try:
-                            yield json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                    return
-            except (httpx.TimeoutException, httpx.TransportError) as exc:
-                last_exc = exc
-                if attempt == self.max_retries:
-                    raise
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code < 500:
-                    raise
-                last_exc = exc
-                if attempt == self.max_retries:
-                    raise
-            if attempt < self.max_retries:
-                backoff = 2**attempt
-                time.sleep(backoff + random.uniform(0, backoff * 0.25))
-        raise RuntimeError("Unexpected retry loop exit") from last_exc
-
-    async def _do_request_async(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Perform an asynchronous (non-streaming) HTTP POST with retries."""
-        headers = self._build_headers()
-        last_exc: Optional[Exception] = None
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            for attempt in range(self.max_retries + 1):
-                try:
-                    response = await client.post(
-                        self._inference_url,
-                        headers=headers,
-                        json=payload,
-                    )
-
-                    if response.status_code == 401:
-                        await self._refresh_token_async()
-                        headers = self._build_headers()
-                        response = await client.post(
-                            self._inference_url,
-                            headers=headers,
-                            json=payload,
-                        )
-
-                    response.raise_for_status()
-                    return response.json()
-                except (httpx.TimeoutException, httpx.TransportError) as exc:
-                    last_exc = exc
-                    if attempt == self.max_retries:
-                        raise
-                except httpx.HTTPStatusError as exc:
-                    if exc.response.status_code < 500:
-                        raise
-                    last_exc = exc
-                    if attempt == self.max_retries:
-                        raise
-                if attempt < self.max_retries:
-                    backoff = 2**attempt
-                    await asyncio.sleep(backoff + random.uniform(0, backoff * 0.25))
-        raise RuntimeError("Unexpected retry loop exit") from last_exc
-
-    async def _do_stream_async(
-        self, payload: Dict[str, Any]
-    ) -> AsyncIterator[Dict[str, Any]]:
-        """Perform an asynchronous streaming HTTP POST and yield parsed SSE chunks."""
-        headers = self._build_headers()
-        last_exc: Optional[Exception] = None
-        for attempt in range(self.max_retries + 1):
-            try:
-                async with httpx.AsyncClient(timeout=self.timeout) as client:
-                    async with client.stream(
-                        "POST",
-                        self._inference_url,
-                        headers=headers,
-                        json=payload,
-                    ) as response:
-                        if response.status_code == 401:
-                            await self._refresh_token_async()
-                            headers = self._build_headers()
-                            raise httpx.TransportError(
-                                "401 — token refreshed, retrying"
-                            )
-                        response.raise_for_status()
-                        async for line in response.aiter_lines():
-                            line = line.strip()
-                            if not line or line == "data: [DONE]":
-                                continue
-                            if line.startswith("data: "):
-                                line = line[len("data: ") :]
-                            try:
-                                yield json.loads(line)
-                            except json.JSONDecodeError:
-                                continue
-                        return
-            except (httpx.TimeoutException, httpx.TransportError) as exc:
-                last_exc = exc
-                if attempt == self.max_retries:
-                    raise
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code < 500:
-                    raise
-                last_exc = exc
-                if attempt == self.max_retries:
-                    raise
-            if attempt < self.max_retries:
-                backoff = 2**attempt
-                await asyncio.sleep(backoff + random.uniform(0, backoff * 0.25))
-        raise RuntimeError("Unexpected retry loop exit") from last_exc
-
-    # ------------------------------------------------------------------
-    # Stream delta → AIMessageChunk helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _chunk_from_delta(
-        delta: Dict[str, Any],
-        finish_reason: Optional[str],
-        usage: Optional[Dict[str, Any]],
-    ) -> AIMessageChunk:
-        """Convert a single SSE delta object into an ``AIMessageChunk``."""
-        content = delta.get("content") or ""
-        additional_kwargs: Dict[str, Any] = {}
-        tool_call_chunks = []
-
-        raw_tool_calls = delta.get("tool_calls") or []
-        for raw_tc in raw_tool_calls:
-            index = raw_tc.get("index", 0)
-            tc_id = raw_tc.get("id")
-
-            func = raw_tc.get("function", {})
-            tool_call_chunks.append(
-                create_tool_call_chunk(
-                    name=func.get("name"),
-                    args=func.get("arguments"),
-                    id=tc_id,
-                    index=index,
-                )
-            )
-
-        response_metadata: Dict[str, Any] = {}
-        if finish_reason:
-            response_metadata["finish_reason"] = finish_reason
-
-        usage_metadata: Optional[UsageMetadata] = None
-        if usage:
-            usage_metadata = UsageMetadata(
-                input_tokens=usage.get("prompt_tokens", 0),
-                output_tokens=usage.get("completion_tokens", 0),
-                total_tokens=usage.get("total_tokens", 0),
-            )
-            response_metadata["usage"] = usage
-
-        return AIMessageChunk(
-            content=content,
-            additional_kwargs=additional_kwargs,
-            tool_call_chunks=tool_call_chunks,
-            response_metadata=response_metadata,
-            usage_metadata=usage_metadata,
-        )
-
-    @staticmethod
-    def _make_usage_chunk(usage: Dict[str, Any]) -> ChatGenerationChunk:
-        """Build a usage-only final ``ChatGenerationChunk`` from a usage dict."""
-        return ChatGenerationChunk(
-            message=AIMessageChunk(
-                content="",
-                usage_metadata=UsageMetadata(
-                    input_tokens=usage.get("prompt_tokens", 0),
-                    output_tokens=usage.get("completion_tokens", 0),
-                    total_tokens=usage.get("total_tokens", 0),
-                ),
-                response_metadata={"usage": usage},
-            )
-        )
-
-    # ------------------------------------------------------------------
-    # LangChain BaseChatModel interface
-    # ------------------------------------------------------------------
+        return values
 
     @property
     def _llm_type(self) -> str:
         return "github-copilot"
 
-    @property
-    def _identifying_params(self) -> Dict[str, Any]:
-        return {
-            "model_name": self.model_name,
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
-        }
+    # ------------------------------------------------------------------
+    # Token refresh helpers
+    # ------------------------------------------------------------------
 
-    def _get_ls_params(
-        self,
-        stop: Optional[List[str]] = None,
-        **kwargs: Any,
-    ) -> LangSmithParams:
-        params = self._identifying_params
-        return LangSmithParams(
-            ls_provider="github-copilot",
-            ls_model_name=self.model_name,
-            ls_model_type="chat",
-            ls_temperature=params.get("temperature"),
-            ls_max_tokens=params.get("max_tokens"),
-            ls_stop=stop or self.stop or [],
-        )
+    def _get_github_token_str(self) -> str:
+        """Return the underlying GitHub OAuth token string."""
+        if self.github_token:
+            return self.github_token.get_secret_value()
+        env = os.environ.get("GITHUB_TOKEN", "")
+        if env:
+            return env
+        cached = load_tokens_from_cache()
+        return cached.get("github_token", "")
+
+    def _refresh_copilot_token(self) -> bool:
+        """Synchronously fetch a new Copilot token and rebuild the OpenAI clients.
+
+        Returns True if the token was refreshed successfully.
+        """
+        if not _sync_token_refresh_lock.acquire(blocking=False):
+            # Another thread is refreshing; wait for it to finish, then return.
+            _sync_token_refresh_lock.acquire()
+            _sync_token_refresh_lock.release()
+            return False
+        try:
+            gh_token = self._get_github_token_str()
+            if not gh_token or not _is_exchangeable_github_token(gh_token):
+                logger.warning(
+                    "Cannot refresh Copilot token: no exchangeable GitHub "  # noqa: E501
+                    "token available (token prefix: %s...).",
+                    gh_token[:8] if gh_token else "<empty>",
+                )
+                return False
+
+            new_token, expires_at = fetch_copilot_token(gh_token)
+            if not new_token:
+                logger.warning("Copilot token refresh returned no token.")
+                return False
+
+            save_tokens_to_cache(gh_token, new_token, expires_at)
+            self.openai_api_key = SecretStr(new_token)
+            self._rebuild_clients()
+            logger.debug("Copilot token refreshed successfully.")
+            return True
+        finally:
+            _sync_token_refresh_lock.release()
+
+    async def _arefresh_copilot_token(self) -> bool:
+        """Asynchronously fetch a new Copilot token and rebuild the OpenAI clients.
+
+        Returns True if the token was refreshed successfully.
+        """
+        lock = _get_token_refresh_lock()
+        async with lock:
+            gh_token = self._get_github_token_str()
+            if not gh_token or not _is_exchangeable_github_token(gh_token):
+                logger.warning(
+                    "Cannot refresh Copilot token: no exchangeable GitHub "  # noqa: E501
+                    "token available (token prefix: %s...).",
+                    gh_token[:8] if gh_token else "<empty>",
+                )
+                return False
+
+            new_token, expires_at = await afetch_copilot_token(gh_token)
+            if not new_token:
+                logger.warning("Copilot token refresh returned no token.")
+                return False
+
+            save_tokens_to_cache(gh_token, new_token, expires_at)
+            self.openai_api_key = SecretStr(new_token)
+            self._rebuild_clients()
+            logger.debug("Copilot token refreshed successfully (async).")
+            return True
+
+    def _rebuild_clients(self) -> None:
+        """Nullify and rebuild the underlying OpenAI sync/async clients."""
+        self.client = None
+        self.async_client = None
+        self.root_client = None
+        self.root_async_client = None
+        # validate_environment re-creates the clients from the current field values.
+        self.validate_environment()  # type: ignore[operator]
+
+    def _maybe_refresh_token_proactively(self) -> None:
+        """Check the cached token expiry and refresh proactively if needed."""
+        cached = load_tokens_from_cache()
+        expires_at = cached.get("expires_at")
+        if (
+            expires_at is not None
+            and time.time() >= float(expires_at) - _TOKEN_REFRESH_BUFFER_SECS
+        ):
+            logger.debug("Copilot token near/past expiry — proactively refreshing.")
+            self._refresh_copilot_token()
+
+    async def _amaybe_refresh_token_proactively(self) -> None:
+        """Async version: check the cached token expiry and refresh if needed."""
+        cached = load_tokens_from_cache()
+        expires_at = cached.get("expires_at")
+        if (
+            expires_at is not None
+            and time.time() >= float(expires_at) - _TOKEN_REFRESH_BUFFER_SECS
+        ):
+            logger.debug(
+                "Copilot token near/past expiry — proactively refreshing (async)."
+            )
+            await self._arefresh_copilot_token()
+
+    # ------------------------------------------------------------------
+    # Overrides with token-refresh retry logic
+    # ------------------------------------------------------------------
 
     def _generate(
         self,
         messages: List[BaseMessage],
         stop: Optional[List[str]] = None,
-        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        run_manager: Optional[Any] = None,
         **kwargs: Any,
     ) -> ChatResult:
-        """Call the GitHub Models chat completions API and return a ChatResult."""
-        payload = self._build_payload(messages, stop=stop, stream=False, **kwargs)
-        response_data = self._do_request(payload)
-
-        choices = response_data.get("choices", [])
-        if not choices:
-            raise ValueError(
-                f"GitHub Models API returned no choices. Response: {response_data}"
+        self._maybe_refresh_token_proactively()
+        try:
+            return super()._generate(
+                messages, stop=stop, run_manager=run_manager, **kwargs
             )
-
-        usage = response_data.get("usage")
-        generations = []
-        for choice in choices:
-            ai_msg = _build_ai_message(choice, usage)
-            generations.append(ChatGeneration(message=ai_msg))
-
-        return ChatResult(generations=generations)
+        except (openai.AuthenticationError, openai.BadRequestError) as exc:
+            if not _is_auth_error(exc):
+                raise
+            logger.warning("Copilot token rejected; refreshing and retrying. %s", exc)
+            if self._refresh_copilot_token():
+                return super()._generate(
+                    messages, stop=stop, run_manager=run_manager, **kwargs
+                )
+            raise
 
     def _stream(
         self,
         messages: List[BaseMessage],
         stop: Optional[List[str]] = None,
-        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        run_manager: Optional[Any] = None,
         **kwargs: Any,
     ) -> Iterator[ChatGenerationChunk]:
-        """Stream token-level chunks from the GitHub Models API."""
-        payload = self._build_payload(messages, stop=stop, stream=True, **kwargs)
-
-        for raw_chunk in self._do_stream(payload):
-            choices = raw_chunk.get("choices", [])
-            usage = raw_chunk.get(
-                "usage"
-            )  # present in the final chunk when include_usage=True
-
-            if not choices and usage:
-                # Final usage-only chunk
-                chunk = self._make_usage_chunk(usage)
-                if run_manager:
-                    run_manager.on_llm_new_token("", chunk=chunk)
-                yield chunk
-                continue
-
-            for choice in choices:
-                delta = choice.get("delta", {})
-                finish_reason = choice.get("finish_reason")
-                ai_chunk = self._chunk_from_delta(delta, finish_reason, usage)
-                gen_chunk = ChatGenerationChunk(message=ai_chunk)
-
-                if run_manager and ai_chunk.content:
-                    run_manager.on_llm_new_token(str(ai_chunk.content), chunk=gen_chunk)
-                yield gen_chunk
+        self._maybe_refresh_token_proactively()
+        try:
+            yield from super()._stream(
+                messages, stop=stop, run_manager=run_manager, **kwargs
+            )
+        except (openai.AuthenticationError, openai.BadRequestError) as exc:
+            if not _is_auth_error(exc):
+                raise
+            logger.warning("Copilot token rejected; refreshing and retrying. %s", exc)
+            if self._refresh_copilot_token():
+                yield from super()._stream(
+                    messages, stop=stop, run_manager=run_manager, **kwargs
+                )
+            else:
+                raise
 
     async def _agenerate(
         self,
         messages: List[BaseMessage],
         stop: Optional[List[str]] = None,
-        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+        run_manager: Optional[Any] = None,
         **kwargs: Any,
     ) -> ChatResult:
-        """Async version of ``_generate``."""
-        payload = self._build_payload(messages, stop=stop, stream=False, **kwargs)
-        response_data = await self._do_request_async(payload)
-
-        choices = response_data.get("choices", [])
-        if not choices:
-            raise ValueError(
-                f"GitHub Models API returned no choices. Response: {response_data}"
+        await self._amaybe_refresh_token_proactively()
+        try:
+            return await super()._agenerate(
+                messages, stop=stop, run_manager=run_manager, **kwargs
             )
-
-        usage = response_data.get("usage")
-        generations = []
-        for choice in choices:
-            ai_msg = _build_ai_message(choice, usage)
-            generations.append(ChatGeneration(message=ai_msg))
-
-        return ChatResult(generations=generations)
+        except (openai.AuthenticationError, openai.BadRequestError) as exc:
+            if not _is_auth_error(exc):
+                raise
+            logger.warning("Copilot token rejected; refreshing and retrying. %s", exc)
+            if await self._arefresh_copilot_token():
+                return await super()._agenerate(
+                    messages, stop=stop, run_manager=run_manager, **kwargs
+                )
+            raise
 
     async def _astream(
         self,
         messages: List[BaseMessage],
         stop: Optional[List[str]] = None,
-        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+        run_manager: Optional[Any] = None,
         **kwargs: Any,
     ) -> AsyncIterator[ChatGenerationChunk]:
-        """Async streaming version of ``_stream``."""
-        payload = self._build_payload(messages, stop=stop, stream=True, **kwargs)
-
-        async for raw_chunk in self._do_stream_async(payload):
-            choices = raw_chunk.get("choices", [])
-            usage = raw_chunk.get("usage")
-
-            if not choices and usage:
-                chunk = self._make_usage_chunk(usage)
-                if run_manager:
-                    await run_manager.on_llm_new_token("", chunk=chunk)
+        await self._amaybe_refresh_token_proactively()
+        try:
+            async for chunk in super()._astream(
+                messages, stop=stop, run_manager=run_manager, **kwargs
+            ):
                 yield chunk
-                continue
+        except (openai.AuthenticationError, openai.BadRequestError) as exc:
+            if not _is_auth_error(exc):
+                raise
+            logger.warning("Copilot token rejected; refreshing and retrying. %s", exc)
+            if await self._arefresh_copilot_token():
+                async for chunk in super()._astream(
+                    messages, stop=stop, run_manager=run_manager, **kwargs
+                ):
+                    yield chunk
+            else:
+                raise
 
-            for choice in choices:
-                delta = choice.get("delta", {})
-                finish_reason = choice.get("finish_reason")
-                ai_chunk = self._chunk_from_delta(delta, finish_reason, usage)
-                gen_chunk = ChatGenerationChunk(message=ai_chunk)
+    @classmethod
+    def get_available_models(
+        cls,
+        github_token: Optional[str] = None,
+        copilot_token: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get the list of available models from the GitHub Copilot API.
 
-                if run_manager and ai_chunk.content:
-                    await run_manager.on_llm_new_token(
-                        str(ai_chunk.content), chunk=gen_chunk
-                    )
-                yield gen_chunk
-
-    # ------------------------------------------------------------------
-    # Tool calling support
-    # ------------------------------------------------------------------
-
-    def bind_tools(
-        self,
-        tools: Sequence[Union[Dict[str, Any], BaseTool, Type, Any]],
-        *,
-        tool_choice: Optional[Union[str, Literal["auto", "required", "none"]]] = None,
-        **kwargs: Any,
-    ) -> "ChatGithubCopilot":
-        """Bind tools to this model, enabling tool calling.
-
-        Args:
-            tools: A list of tools to bind.  Accepts LangChain ``BaseTool``
-                instances, Pydantic models, or pre-formatted OpenAI tool dicts.
-            tool_choice: Controls tool selection.  One of ``"auto"``,
-                ``"required"``, ``"none"``, or the name of a specific tool.
-                Defaults to ``"auto"`` when tools are provided.
-
-        Returns:
-            A new ``ChatGithubCopilot`` instance with ``tools`` bound.
-
-        Example:
-            .. code-block:: python
-
-                from pydantic import BaseModel, Field
-
-                class SearchWeb(BaseModel):
-                    '''Search the web for up-to-date information.'''
-                    query: str = Field(..., description="The search query")
-
-                llm_with_tools = llm.bind_tools([SearchWeb])
-                ai_msg = llm_with_tools.invoke("Who won the 2024 Olympics 100m sprint?")
-                print(ai_msg.tool_calls)
+        Resolution order:
+        1. Explicit ``copilot_token`` parameter.
+        2. Cached copilot token from ``~/.github-copilot-chat.json``.
+        3. Exchange ``github_token`` / ``GITHUB_TOKEN`` env var for a copilot token.
         """
-        formatted_tools = _format_tools_for_api(tools)
-        tool_choice_param: Optional[str] = tool_choice or (
-            "auto" if formatted_tools else None
-        )
-        return self.bind(
-            tools=formatted_tools,
-            tool_choice=tool_choice_param,
-            **kwargs,
-        )  # type: ignore[return-value]
+        token = copilot_token
+
+        if not token:
+            cached = load_tokens_from_cache()
+            token = cached.get("copilot_token")
+
+        if not token:
+            gh_token = github_token or os.environ.get("GITHUB_TOKEN")
+            if not gh_token:
+                raise ValueError(
+                    "A GitHub token or Copilot token is required. Set the "
+                    "GITHUB_TOKEN environment variable, pass ``github_token``, "
+                    "or pass ``copilot_token``."
+                )
+            if _is_exchangeable_github_token(gh_token):
+                exchanged, _ = fetch_copilot_token(gh_token)
+                if exchanged:
+                    token = exchanged
+            if not token:
+                token = gh_token
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            **COPILOT_DEFAULT_HEADERS,
+        }
+
+        with httpx.Client() as client:
+            response = client.get(f"{_GITHUB_COPILOT_BASE_URL}/models", headers=headers)
+            response.raise_for_status()
+            all_models: List[Dict[str, Any]] = response.json().get("data", [])
+
+        return [m for m in all_models if _supports_chat_completions(m)]
+
+
+def _supports_chat_completions(model: Dict[str, Any]) -> bool:
+    """Return True if *model* supports the ``/chat/completions`` endpoint.
+
+    Models that omit ``supported_endpoints`` are legacy Azure OpenAI models
+    that have always been served via ``/chat/completions``.
+    """
+    endpoints = model.get("supported_endpoints")
+    if endpoints is None:
+        # Field absent → legacy model, assume chat/completions
+        return True
+    return "/chat/completions" in endpoints
 
 
 # ---------------------------------------------------------------------------
