@@ -79,9 +79,7 @@ def test_load_tokens_returns_empty_on_expired_token(tmp_path: object) -> None:
         "copilot_token": "copilot_old",
         "expires_at": time.time() - 10,
     }
-    with patch(
-        "builtins.open", mock_open(read_data=json.dumps(expired_data))
-    ):
+    with patch("builtins.open", mock_open(read_data=json.dumps(expired_data))):
         result = load_tokens_from_cache()
     assert result == {}
 
@@ -93,8 +91,6 @@ def test_load_tokens_returns_data_for_valid_token() -> None:
         "copilot_token": "copilot_good",
         "expires_at": time.time() + 3600,
     }
-    with patch(
-        "builtins.open", mock_open(read_data=json.dumps(valid_data))
-    ):
+    with patch("builtins.open", mock_open(read_data=json.dumps(valid_data))):
         result = load_tokens_from_cache()
     assert result["copilot_token"] == "copilot_good"

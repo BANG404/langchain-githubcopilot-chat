@@ -619,9 +619,7 @@ def test_token_cache_load_stores_expires_at(monkeypatch: pytest.MonkeyPatch) -> 
 
 def test_retry_backoff_jitter_sync(monkeypatch: pytest.MonkeyPatch) -> None:
     """Sync retry should sleep with jitter on transient failures."""
-    llm = ChatGithubCopilot(
-        model="openai/gpt-4.1", github_token="tok", max_retries=1
-    )
+    llm = ChatGithubCopilot(model="openai/gpt-4.1", github_token="tok", max_retries=1)
     sleep_calls: list = []
 
     def fake_sleep(secs: float) -> None:
@@ -653,9 +651,7 @@ def test_retry_backoff_jitter_sync(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.asyncio
 async def test_retry_backoff_jitter_async(monkeypatch: pytest.MonkeyPatch) -> None:
     """Async retry should sleep with jitter on transient failures."""
-    llm = ChatGithubCopilot(
-        model="openai/gpt-4.1", github_token="tok", max_retries=1
-    )
+    llm = ChatGithubCopilot(model="openai/gpt-4.1", github_token="tok", max_retries=1)
     sleep_calls: list = []
 
     async def fake_async_sleep(secs: float) -> None:
@@ -676,8 +672,9 @@ async def test_retry_backoff_jitter_async(monkeypatch: pytest.MonkeyPatch) -> No
         "langchain_githubcopilot_chat.chat_models.asyncio.sleep",
         side_effect=fake_async_sleep,
     )
-    with patch("httpx.AsyncClient", return_value=mock_client), \
-            async_sleep_patch, async_uniform_patch:
+    with patch(
+        "httpx.AsyncClient", return_value=mock_client
+    ), async_sleep_patch, async_uniform_patch:
         with pytest.raises(httpx.TransportError):
             await llm._do_request_async({"model": "openai/gpt-4.1", "messages": []})
 
