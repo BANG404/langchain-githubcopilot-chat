@@ -203,37 +203,11 @@ def _build_ai_message(
 
     usage_metadata: Optional[UsageMetadata] = None
     if usage:
-        input_token_details: Dict[str, Any] = {}
-        if "prompt_tokens_details" in usage:
-            if "cached_tokens" in usage["prompt_tokens_details"]:
-                input_token_details["cache_read"] = usage["prompt_tokens_details"][
-                    "cached_tokens"
-                ]
-
-        output_token_details: Dict[str, Any] = {}
-        if "reasoning_tokens" in usage:
-            output_token_details["reasoning"] = usage["reasoning_tokens"]
-        if "completion_tokens_details" in usage:
-            if "accepted_prediction_tokens" in usage["completion_tokens_details"]:
-                output_token_details["accepted_prediction"] = usage[
-                    "completion_tokens_details"
-                ]["accepted_prediction_tokens"]
-            if "rejected_prediction_tokens" in usage["completion_tokens_details"]:
-                output_token_details["rejected_prediction"] = usage[
-                    "completion_tokens_details"
-                ]["rejected_prediction_tokens"]
-
-        kwargs = {
-            "input_tokens": usage.get("prompt_tokens", 0),
-            "output_tokens": usage.get("completion_tokens", 0),
-            "total_tokens": usage.get("total_tokens", 0),
-        }
-        if input_token_details:
-            kwargs["input_token_details"] = input_token_details
-        if output_token_details:
-            kwargs["output_token_details"] = output_token_details
-
-        usage_metadata = UsageMetadata(**kwargs)
+        usage_metadata = UsageMetadata(
+            input_tokens=usage.get("prompt_tokens", 0),
+            output_tokens=usage.get("completion_tokens", 0),
+            total_tokens=usage.get("total_tokens", 0),
+        )
 
     response_metadata: Dict[str, Any] = {
         "finish_reason": finish_reason,
