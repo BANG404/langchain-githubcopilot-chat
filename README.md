@@ -38,7 +38,7 @@ def on_message(msg):
     # Handle status messages (e.g., display in UI)
     print(f"[Copilot] {msg}")
 
-token = get_vscode_token(callback=on_message)
+token = get_copilot_token(callback=on_message)
 ```
 
 Alternatively, set it as an environment variable:
